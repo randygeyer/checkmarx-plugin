@@ -35,6 +35,7 @@ import java.util.Map;
 
 import static ch.lambdaj.Lambda.*;
 import com.checkmarx.jenkins.utils.CxProxyUtility;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * Wraps all Web services invocations
@@ -49,6 +50,7 @@ public class CxWebService {
     private static final String CHECKMARX_SERVER_WAS_NOT_FOUND_ON_THE_SPECIFIED_ADRESS = "Checkmarx server was not found on the specified address";
     private static final int WEBSERVICE_API_VERSION = 1;
     private static final String CXWSRESOLVER_PATH = "/cxwebinterface/cxwsresolver.asmx";
+    private static final String WSDL_SUFFIX = "?wsdl";
     private static final int LCID = 1033; // English
     private static final int MILISECONDS_IN_MINUTE = 1000 * 60;
 
@@ -106,13 +108,17 @@ public class CxWebService {
             logger.error(message);
             throw new AbortException(message);
         }
-        URL webServiceUrl = new URL(cxWSResponseDiscovery.getServiceURL());
+        String webService = cxWSResponseDiscovery.getServiceURL();
+        if (!StringUtils.endsWith(webService, WSDL_SUFFIX)) 
+            webService += WSDL_SUFFIX;
+        
+        URL webServiceUrl = new URL(webService);
         logger.info("Webservice url: " + webServiceUrl);
         return webServiceUrl;
     }
 
     private CxWSResolverSoap getCxWSResolverSoap(@NotNull String serverUrl) throws MalformedURLException, AbortException {
-        URL resolverUrl = new URL(serverUrl + CXWSRESOLVER_PATH);
+        URL resolverUrl = new URL(serverUrl + CXWSRESOLVER_PATH + "?wsdl");
 
         checkServerConnectivity(resolverUrl);
 
