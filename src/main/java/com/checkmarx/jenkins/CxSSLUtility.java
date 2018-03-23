@@ -78,7 +78,8 @@ public class CxSSLUtility {
 
         // Install the fake trust manager
         try {
-            final SSLContext context = SSLContext.getInstance("TLSv1");
+            //final SSLContext context = SSLContext.getInstance("TLSv1");
+            final SSLContext context = SSLContext.getDefault();
             context.init(null, trustManagers, null);
             HttpsURLConnection.setDefaultSSLSocketFactory(context.getSocketFactory());
         } catch (KeyManagementException e) {
