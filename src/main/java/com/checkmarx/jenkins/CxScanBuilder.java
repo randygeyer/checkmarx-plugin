@@ -687,6 +687,10 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
 
             jobConsoleLogger.info("Checkmarx Jenkins plugin version: " + CxConfig.version());
+            
+            jobConsoleLogger.info("  Master dir: " + run.getRootDir().getAbsolutePath());
+            jobConsoleLogger.info("  Workspace : " + workspace.getRemote());
+            
             printConfiguration(descriptor);
 
             if (isSkipScan(run)) {

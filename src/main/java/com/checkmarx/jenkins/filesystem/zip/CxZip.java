@@ -27,6 +27,7 @@ public class CxZip implements Serializable {
     public CxZip(FilePath workspace, final TaskListener listener) {
         this.workspace = workspace;
         this.logger = new CxPluginLogger(listener);
+        logger.info("CxZip Workspace: " + this.workspace.getRemote());
     }
 
     public FilePath ZipWorkspaceFolder(String filterPattern) throws IOException, InterruptedException {

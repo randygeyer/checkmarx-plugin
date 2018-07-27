@@ -136,6 +136,9 @@ public class Zipper {
             assert baseDir != null : "baseDir must not be null";
             assert outputStream != null : "outputStream must not be null";
 
+            updateInfoProgress("Zipping: " + baseDir.getAbsolutePath());
+            updateInfoProgress("  filterPatterns: " + filterPatterns);
+            
             ds = createDirectoryScanner(baseDir, filterPatterns);
             ds.setFollowSymlinks(true);
             ds.scan();
@@ -178,8 +181,10 @@ public class Zipper {
         DirectoryScanner ds = null;
         try {
             assert baseDir != null : "baseDir must not be null";
-                assert outputStream != null : "outputStream must not be null";
+            assert outputStream != null : "outputStream must not be null";
 
+            this.updateInfoProgress("Zipping "+ baseDir.getAbsolutePath());
+    
             ds = createDirectoryScanner(baseDir, filterExcludePatterns, filterIncludePatterns);
             ds.setFollowSymlinks(true);
             ds.scan();
