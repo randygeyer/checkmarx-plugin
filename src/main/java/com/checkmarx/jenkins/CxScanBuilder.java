@@ -1744,6 +1744,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
                 return FormValidation.ok("Success");
 
             } catch (Exception e) {
+                STATIC_LOGGER.error(e.getMessage(), e);
                 return FormValidation.error(e.getMessage());
             }
         }
@@ -1785,7 +1786,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
                 return projectNames;
 
             } catch (Exception e) {
-                STATIC_LOGGER.error("Failed to populate project list: " + e.toString());
+                STATIC_LOGGER.error("Failed to populate project list: " + e.toString(), e);
                 STATIC_LOGGER.info("Projects list: empty");
                 return projectNames; // Return empty list of project names
             }
@@ -1816,6 +1817,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
                         resolvedProjectName = ev.expand(projectName);
                     }
                     CxWSBasicRepsonse cxWSBasicRepsonse = cxWebService.validateProjectName(resolvedProjectName, groupId);
+                    STATIC_LOGGER.info(cxWSBasicRepsonse.getErrorMessage());
                     if (cxWSBasicRepsonse.isIsSuccesfull()) {
                         return FormValidation.ok("Project Name Validated Successfully");
                     } else {

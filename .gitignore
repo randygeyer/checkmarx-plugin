@@ -3,6 +3,8 @@ out/
 
 #Gradle
 .gradle/
+.nb-gradle/
+
 build/
 #Maven
 target/
