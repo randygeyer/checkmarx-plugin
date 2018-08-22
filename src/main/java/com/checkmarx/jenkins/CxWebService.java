@@ -62,6 +62,8 @@ public class CxWebService {
         disableCertificateValidation();
 
         validateServerUrl(serverUrl);
+        
+        Thread.currentThread().setContextClassLoader(CxWebService.class.getClassLoader());
 
         CxWSResolverSoap cxWSResolverSoap = getCxWSResolverSoap(serverUrl);
         webServiceUrl = getWebServiceUrl(cxWSResolverSoap);
@@ -141,7 +143,9 @@ public class CxWebService {
                 throw new AbortException(CHECKMARX_SERVER_WAS_NOT_FOUND_ON_THE_SPECIFIED_ADRESS);
             }
         } catch (IOException e) {
-            logger.error(CHECKMARX_SERVER_WAS_NOT_FOUND_ON_THE_SPECIFIED_ADRESS, e);
+            String msg = String.format("%s : Cause:\n%s", 
+                    CHECKMARX_SERVER_WAS_NOT_FOUND_ON_THE_SPECIFIED_ADRESS, e.toString());
+            logger.error(msg, e);
             throw new AbortException(CHECKMARX_SERVER_WAS_NOT_FOUND_ON_THE_SPECIFIED_ADRESS);
         }
     }
@@ -673,7 +677,7 @@ public class CxWebService {
         } catch (HttpRetryException e) {
             String consoleMessage = "\nCheckmarx plugin for Jenkins does not support Single sign-on authentication."
                     + "\nPlease, configure Checkmarx server to work in Anonymous authentication mode.\n";
-            logger.error(consoleMessage);
+            logger.error(consoleMessage, e);
             throw new AbortException(e.getMessage());
         } catch (IOException | JAXBException | XMLStreamException | InterruptedException e) {
             logger.error(e.getMessage(), e);
