@@ -1,18 +1,29 @@
 package com.checkmarx.jenkins;
 
-import com.checkmarx.jenkins.filesystem.FolderPattern;
-import com.checkmarx.jenkins.filesystem.zip.CxZip;
-import com.checkmarx.jenkins.filesystem.zip.Zipper;
-import com.checkmarx.jenkins.logger.CxPluginLogger;
-import com.checkmarx.jenkins.opensourceanalysis.DependencyFolder;
-import com.checkmarx.jenkins.opensourceanalysis.ScanService;
-import com.checkmarx.jenkins.opensourceanalysis.ScanServiceTools;
-import com.checkmarx.jenkins.web.client.OsaScanClient;
-import com.checkmarx.jenkins.web.contracts.ProjectContract;
-import com.checkmarx.jenkins.web.model.AuthenticationRequest;
-import com.checkmarx.ws.CxJenkinsWebService.*;
-import hudson.*;
-import hudson.console.HyperlinkNote;
+import com.cloudbees.plugins.credentials.CredentialsMatchers;
+import com.cloudbees.plugins.credentials.CredentialsProvider;
+import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
+import com.cloudbees.plugins.credentials.domains.DomainRequirement;
+import com.cx.restclient.CxShragaClient;
+import com.cx.restclient.common.CxGlobalMessage;
+import com.cx.restclient.common.ShragaUtils;
+import com.cx.restclient.common.summary.SummaryUtils;
+import com.cx.restclient.configuration.CxScanConfig;
+import com.cx.restclient.dto.ScanResults;
+import com.cx.restclient.dto.Team;
+import com.cx.restclient.exception.CxClientException;
+import com.cx.restclient.exception.CxTokenExpiredException;
+import com.cx.restclient.osa.dto.OSAResults;
+import com.cx.restclient.sast.dto.CxNameObj;
+import com.cx.restclient.sast.dto.Project;
+import com.cx.restclient.sast.dto.SASTResults;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import freemarker.template.TemplateException;
+import hudson.EnvVars;
+import hudson.Extension;
+import hudson.FilePath;
+import hudson.Launcher;
 import hudson.model.*;
 import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.Builder;
@@ -26,23 +37,23 @@ import jenkins.tasks.SimpleBuildStep;
 import net.sf.json.JSONObject;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
-import org.apache.commons.jelly.JellyContext;
-import org.apache.commons.jelly.XMLOutput;
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringEscapeUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.kohsuke.stapler.*;
-import org.xml.sax.InputSource;
 
 import javax.annotation.Nonnull;
-import javax.xml.ws.WebServiceException;
-import java.io.*;
-import java.net.MalformedURLException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.net.URLDecoder;
-import java.util.Collection;
+import java.net.UnknownHostException;
+import java.nio.charset.Charset;
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -57,54 +68,49 @@ import java.util.regex.Pattern;
 public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
 
+    public static final String SCAN_REPORT_XML = "ScanReport.xml";
+    public static final String OSA_SUMMERY_JSON = "OSASummery.json";
+    public static final String OSA_LIBRARIES_JSON = "OSALibraries.json";
+    public static final String OSA_VULNERABILITIES_JSON = "OSAVulnerabilities.json";
     //////////////////////////////////////////////////////////////////////////////////////
     // Persistent plugin configuration parameters
     //////////////////////////////////////////////////////////////////////////////////////
-
     private boolean useOwnServerCredentials;
-
     @Nullable
     private String serverUrl;
     @Nullable
     private String username;
     @Nullable
     private String password;
+    private String credentialsId;
     @Nullable
     private String projectName;
     @Nullable
     private String groupId;
     @Nullable
     private long projectId;
-
     //used by pipeline
     @Nullable
     private String teamPath;
-
+    private Boolean sastEnabled = true;
     @Nullable
     private String preset;
     private boolean presetSpecified;
-
     private boolean globalExclusions = true;
-
     @Nullable
     private String excludeFolders;
     @Nullable
     private String filterPattern;
-
     private boolean incremental;
     private boolean fullScansScheduled;
     private int fullScanCycle;
-
     private boolean isThisBuildIncremental;
-
     @Nullable
     private String sourceEncoding;
     @Nullable
     private String comment;
-
     private boolean skipSCMTriggers;
     private boolean waitForResultsEnabled;
-
     private boolean vulnerabilityThresholdEnabled;
     @Nullable
     private Integer highThreshold;
@@ -112,8 +118,10 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
     private Integer mediumThreshold;
     @Nullable
     private Integer lowThreshold;
+    private boolean failBuildOnNewResults;
+    private String failBuildOnNewSeverity;
     private boolean generatePdfReport;
-
+    private boolean enableProjectPolicyEnforcement;
     private boolean osaEnabled;
     @Nullable
     private Integer osaHighThreshold;
@@ -121,58 +129,45 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
     private Integer osaMediumThreshold;
     @Nullable
     private Integer osaLowThreshold;
-
     @Nullable
-    private String includeOpenSourceFolders;
+    private String includeOpenSourceFolders;//OSA include/exclude wildcard patterns
     @Nullable
-    private String excludeOpenSourceFolders;
+    private String excludeOpenSourceFolders;//OSA exclude folders
+    @Nullable
+    private String osaArchiveIncludePatterns;
+    private boolean osaInstallBeforeScan;
 
     //////////////////////////////////////////////////////////////////////////////////////
     // Private variables
     //////////////////////////////////////////////////////////////////////////////////////
 
-    // Kept for backward compatibility with old serialized plugin configuration.
-    private static transient Logger staticLogger;
-
-    // STATIC_LOGGER is initialized here due to the pre-perform methods, will NOT print to job console
-    private static CxPluginLogger STATIC_LOGGER = new CxPluginLogger();
+    //server log, will NOT print to job console
+    private static final JenkinsServerLogger serverLog = new JenkinsServerLogger();
     //Print to job console, initialized within perform
-    private volatile transient CxPluginLogger jobConsoleLogger;
-
-    // it is initialized in perform method
+    CxLoggerAdapter log;
     private JobStatusOnError jobStatusOnError;
-
     private String exclusionsSetting;
     private String thresholdSettings;
-
     private Result vulnerabilityThresholdResult;
-
-
+    private Result resolvedVulnerabilityThresholdResult;
     private boolean avoidDuplicateProjectScans;
-
-    public static final String PROJECT_STATE_URL_TEMPLATE = "/CxWebClient/portal#/projectState/{0}/Summary";
-    public static final String ASYNC_MESSAGE = "CxSAST scan was run in asynchronous mode.\nRefer to the {0} for the scan results\n";
-
     public static final int MINIMUM_TIMEOUT_IN_MINUTES = 1;
     public static final String REPORTS_FOLDER = "Checkmarx/Reports";
-
-    private StringBuilder thresholdsError;
-
-    //////////////////////////////////////////////////////////////////////////////////////
-    // Constructors
-    //////////////////////////////////////////////////////////////////////////////////////
+    public static final String CX_ORIGIN = "Jenkins";
 
     @DataBoundConstructor
     public CxScanBuilder(
-            boolean useOwnServerCredentials, // NOSONAR
+            boolean useOwnServerCredentials,
             @Nullable String serverUrl,
             @Nullable String username,
             @Nullable String password,
+            String credentialsId,
             String projectName,
             long projectId,
             String buildStep,
             @Nullable String groupId,
             @Nullable String teamPath, //used by pipeline
+            Boolean sastEnabled,
             @Nullable String preset,
             JobStatusOnError jobStatusOnError,
             boolean presetSpecified,
@@ -190,25 +185,32 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             @Nullable Integer highThreshold,
             @Nullable Integer mediumThreshold,
             @Nullable Integer lowThreshold,
+            boolean failBuildOnNewResults,
+            String failBuildOnNewSeverity,
             boolean osaEnabled,
             @Nullable Integer osaHighThreshold,
             @Nullable Integer osaMediumThreshold,
             @Nullable Integer osaLowThreshold,
             boolean generatePdfReport,
+            boolean enableProjectPolicyEnforcement,
             String thresholdSettings,
             String vulnerabilityThresholdResult,
             @Nullable String includeOpenSourceFolders,
             @Nullable String excludeOpenSourceFolders,
+            @Nullable String osaArchiveIncludePatterns,
+            boolean osaInstallBeforeScan,
             boolean avoidDuplicateProjectScans) {
         this.useOwnServerCredentials = useOwnServerCredentials;
         this.serverUrl = serverUrl;
         this.username = username;
         this.password = Secret.fromString(password).getEncryptedValue();
+        this.credentialsId = credentialsId;
         // Workaround for compatibility with Conditional BuildStep Plugin
         this.projectName = (projectName == null) ? buildStep : projectName;
         this.projectId = projectId;
         this.groupId = groupId;
         this.teamPath = teamPath;
+        this.sastEnabled = sastEnabled;
         this.preset = preset;
         this.jobStatusOnError = jobStatusOnError;
         this.presetSpecified = presetSpecified;
@@ -227,36 +229,26 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         this.highThreshold = highThreshold;
         this.mediumThreshold = mediumThreshold;
         this.lowThreshold = lowThreshold;
+        this.failBuildOnNewResults = failBuildOnNewResults;
+        this.failBuildOnNewSeverity = failBuildOnNewSeverity;
         this.osaEnabled = osaEnabled;
         this.osaHighThreshold = osaHighThreshold;
         this.osaMediumThreshold = osaMediumThreshold;
         this.osaLowThreshold = osaLowThreshold;
         this.generatePdfReport = generatePdfReport;
+        this.enableProjectPolicyEnforcement = enableProjectPolicyEnforcement;
         this.includeOpenSourceFolders = includeOpenSourceFolders;
         this.excludeOpenSourceFolders = excludeOpenSourceFolders;
+        this.osaArchiveIncludePatterns = osaArchiveIncludePatterns;
+        this.osaInstallBeforeScan = osaInstallBeforeScan;
         this.thresholdSettings = thresholdSettings;
-        if(vulnerabilityThresholdResult != null) {
+        if (vulnerabilityThresholdResult != null) {
             this.vulnerabilityThresholdResult = Result.fromString(vulnerabilityThresholdResult);
         }
         this.avoidDuplicateProjectScans = avoidDuplicateProjectScans;
-        init();
     }
 
-    private void init() {
-        updateJobOnGlobalConfigChange();
-    }
-
-    private void updateJobOnGlobalConfigChange() {
-        if (!getDescriptor().isForcingVulnerabilityThresholdEnabled() && shouldUseGlobalThreshold()) {
-            vulnerabilityThresholdEnabled = false;
-        }
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////
     // Configuration fields getters
-    //////////////////////////////////////////////////////////////////////////////////////
-
-
     public boolean isUseOwnServerCredentials() {
         return useOwnServerCredentials;
     }
@@ -281,6 +273,14 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         return Secret.fromString(password).getPlainText();
     }
 
+    public String getCredentialsId() {
+        return credentialsId;
+    }
+
+    public void setCredentialsId(String credentialsId) {
+        this.credentialsId = credentialsId;
+    }
+
     @Nullable
     public String getProjectName() {
         return projectName;
@@ -300,6 +300,14 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
     @Nullable
     public String getTeamPath() {
         return teamPath;
+    }
+
+    public Boolean getSastEnabled() {
+        return sastEnabled;
+    }
+
+    public void setSastEnabled(Boolean sastEnabled) {
+        this.sastEnabled = sastEnabled;
     }
 
     @Nullable
@@ -373,7 +381,6 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
     }
 
     public boolean isVulnerabilityThresholdEnabled() {
-        updateJobOnGlobalConfigChange();
         return vulnerabilityThresholdEnabled;
     }
 
@@ -387,6 +394,22 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
     public Integer getLowThreshold() {
         return lowThreshold;
+    }
+
+    public String getFailBuildOnNewSeverity() {
+        return failBuildOnNewSeverity;
+    }
+
+    public void setFailBuildOnNewSeverity(String failBuildOnNewSeverity) {
+        this.failBuildOnNewSeverity = failBuildOnNewSeverity;
+    }
+
+    public boolean isFailBuildOnNewResults() {
+        return failBuildOnNewResults;
+    }
+
+    public void setFailBuildOnNewResults(boolean failBuildOnNewResults) {
+        this.failBuildOnNewResults = failBuildOnNewResults;
     }
 
     public boolean isOsaEnabled() {
@@ -438,8 +461,30 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         return includeOpenSourceFolders;
     }
 
+    @Nullable
+    public String getOsaArchiveIncludePatterns() {
+        return osaArchiveIncludePatterns;
+    }
+
+    public void setOsaArchiveIncludePatterns(@Nullable String osaArchiveIncludePatterns) {
+        this.osaArchiveIncludePatterns = osaArchiveIncludePatterns;
+    }
+
+    @Nullable
+    public boolean isOsaInstallBeforeScan() {
+        return osaInstallBeforeScan;
+    }
+
+    public void setOsaInstallBeforeScan(@Nullable boolean osaInstallBeforeScan) {
+        this.osaInstallBeforeScan = osaInstallBeforeScan;
+    }
+
     public boolean isGeneratePdfReport() {
         return generatePdfReport;
+    }
+
+    public boolean isEnableProjectPolicyEnforcement() {
+        return enableProjectPolicyEnforcement;
     }
 
     public boolean isAvoidDuplicateProjectScans() {
@@ -457,13 +502,13 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
     @DataBoundSetter
     public void setVulnerabilityThresholdResult(String result) {
-        if(result != null) {
+        if (result != null) {
             this.vulnerabilityThresholdResult = Result.fromString(result);
         }
     }
 
     public String getVulnerabilityThresholdResult() {
-        if(vulnerabilityThresholdResult != null) {
+        if (vulnerabilityThresholdResult != null) {
             return vulnerabilityThresholdResult.toString();
         }
         return null;
@@ -580,6 +625,11 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
     }
 
     @DataBoundSetter
+    public void setEnableProjectPolicyEnforcement(boolean enableProjectPolicyEnforcement) {
+        this.enableProjectPolicyEnforcement = enableProjectPolicyEnforcement;
+    }
+
+    @DataBoundSetter
     public void setIncludeOpenSourceFolders(@Nullable String includeOpenSourceFolders) {
         this.includeOpenSourceFolders = includeOpenSourceFolders;
     }
@@ -620,440 +670,392 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
     @Override
     public void perform(@Nonnull Run<?, ?> run, @Nonnull FilePath workspace, @Nonnull Launcher launcher, @Nonnull TaskListener listener) throws InterruptedException, IOException {
 
+        log = new CxLoggerAdapter(listener.getLogger());
 
-
-        //set to the logger to print into the job console
-        jobConsoleLogger = new CxPluginLogger(listener);
-
-        final DescriptorImpl descriptor = getDescriptor();
-
-        CxWSResponseRunID cxWSResponseRunID = null;
-        CxWebService cxWebService = null;
-        CxWSCreateReportResponse reportResponse = null;
-
-        try {
-            File checkmarxBuildDir = new File(run.getRootDir(), "checkmarx");
-            checkmarxBuildDir.mkdir();
-
-
-            jobConsoleLogger.info("Checkmarx Jenkins plugin version: " + CxConfig.version());
-            printConfiguration(descriptor);
-
-            if (isSkipScan(run)) {
-                jobConsoleLogger.info("Checkmarx scan skipped since the build was triggered by SCM. " +
-                        "Visit plugin configuration page to disable this skip.");
-                return;
-            }
-            final String serverUrlToUse = isUseOwnServerCredentials() ? getServerUrl() : descriptor.getServerUrl();
-            final String usernameToUse = isUseOwnServerCredentials() ? getUsername() : descriptor.getUsername();
-            final String passwordToUse = isUseOwnServerCredentials() ? getPasswordPlainText() : descriptor.getPasswordPlainText();
-
-            String serverUrlToUseNotNull = serverUrlToUse != null ? serverUrlToUse : "";
-
-            cxWebService = new CxWebService(serverUrlToUseNotNull, jobConsoleLogger);
-            cxWebService.login(usernameToUse, passwordToUse);
-
-            jobConsoleLogger.info("Checkmarx server login successful");
-
-            if(!StringUtils.isEmpty(teamPath)) {
-                jobConsoleLogger.info("Resolving teamPath ["+teamPath+"] to groupId");
-                groupId = cxWebService.resolveGroupId(teamPath);
-            }
-
-            projectId = cxWebService.resolveProjectId(run.getEnvironment(listener).expand(projectName), groupId);
-            if (needToAvoidDuplicateProjectScans(cxWebService)) {
-                jobConsoleLogger.info("\nAvoid duplicate project scans in queue\n");
-                return;
-            }
-
-            if (descriptor.isProhibitProjectCreation() && projectId == 0) {
-                jobConsoleLogger.info("\nCreation of the new project " + projectName + " is not authorized. Please use an existing project.");
-                jobConsoleLogger.info("You can enable the creation of new projects by disabling the \"Deny new Checkmarx projects creation\" checkbox in the Jenkins plugin global settings.\n");
-                run.setResult(Result.FAILURE);
-                return;
-            }
-
-            //If there no project under the project name a new project will be created
-            cxWSResponseRunID = submitScan(run, workspace, cxWebService, listener);
-            projectId = cxWSResponseRunID.getProjectID();
-
-            boolean shouldRunAsynchronous = scanShouldRunAsynchronous(descriptor);
-            if (shouldRunAsynchronous) {
-                logAsyncMessage(serverUrlToUse);
-                addScanResultAction(run, serverUrlToUse, shouldRunAsynchronous, null);
-                if (osaEnabled) {
-                    try {
-                        analyzeOpenSources(run, workspace, serverUrlToUseNotNull, usernameToUse, passwordToUse, cxWebService, listener, shouldRunAsynchronous);
-                    } catch (Exception ignored) {
-                    }
-                }
-                return;
-            }
-
-            long scanId = cxWebService.trackScanProgress(cxWSResponseRunID, usernameToUse, passwordToUse, descriptor.getScanTimeOutEnabled(), descriptor.getScanTimeoutDuration());
-
-            if (scanId == 0) {
-                run.setResult(Result.UNSTABLE);
-                return;
-            }
-
-            reportResponse = cxWebService.generateScanReport(scanId, CxWSReportType.XML);
-            File xmlReportFile = new File(checkmarxBuildDir, "ScanReport.xml");
-            cxWebService.retrieveScanReport(reportResponse.getID(), xmlReportFile, CxWSReportType.XML);
-
-            if (generatePdfReport) {
-                reportResponse = cxWebService.generateScanReport(scanId, CxWSReportType.PDF);
-                File pdfReportFile = new File(checkmarxBuildDir, CxScanResult.PDF_REPORT_NAME);
-                cxWebService.retrieveScanReport(reportResponse.getID(), pdfReportFile, CxWSReportType.PDF);
-            }
-
-
-            CxScanResult cxScanResult = addScanResultAction(run, serverUrlToUse, shouldRunAsynchronous, xmlReportFile);
-            cxScanResult.setScanId(scanId);
-            // Set scan results to environment
-            EnvVarAction envVarAction = new EnvVarAction();
-            envVarAction.setCxSastResults(cxScanResult);
-            run.addAction(envVarAction);
-
-            //CxSAST Thresholds
-            thresholdsError = new StringBuilder();
-            ThresholdConfig thresholdConfig = createThresholdConfig();
-
-            // Set scan thresholds for the summery.jelly
-            if (isSASThresholdEffectivelyEnabled()) {
-                cxScanResult.setThresholds(thresholdConfig);
-            }
-
-
-            boolean isSASTThresholdFailedTheBuild = ((descriptor.isForcingVulnerabilityThresholdEnabled() && descriptor.isLockVulnerabilitySettings()) || isVulnerabilityThresholdEnabled())
-                    && isThresholdCrossed(thresholdConfig, cxScanResult.getHighCount(), cxScanResult.getMediumCount(), cxScanResult.getLowCount(), "CxSAST ");
-            printScanResult(cxScanResult);
-
-            //OSA scan
-            boolean isOSAThresholdFailedTheBuild = false;
-
-            if (osaEnabled) {
-
-                OsaScanResult osaScanResult = null;
-                osaScanResult = analyzeOpenSources(run, workspace, serverUrlToUseNotNull, usernameToUse, passwordToUse, cxWebService, listener, shouldRunAsynchronous);
-
-                if(osaScanResult != null) {
-                    //todo: when CxResult + ui report legacy code will be removed, stop using this as a flag for osa scan execution success
-                    //(meaning - move the line below up [under the line "if (osaEnabled)"] and start using the existence of osaScanResult object to decide weather to present osa results)
-                    cxScanResult.setOsaEnabled(true);
-
-                    cxScanResult.setOsaScanResult(osaScanResult);
-
-                    ThresholdConfig osaThresholdConfig = createOsaThresholdConfig();
-                    // Set scan thresholds for the summery.jelly
-                    if (isOsaThresholdEffectivelyEnabled()) {
-                        cxScanResult.setOsaThresholds(osaThresholdConfig);
-                    }
-
-                    createOsaJsonReports(osaScanResult, checkmarxBuildDir);
-
-                    //retrieve osa scan results pdf + html
-                    getOSAReports(cxScanResult.getOsaScanResult().getScanId(), serverUrlToUseNotNull, usernameToUse, passwordToUse, checkmarxBuildDir);
-
-
-                    //OSA Threshold
-                    isOSAThresholdFailedTheBuild = cxScanResult.getOsaScanResult() != null && ((descriptor.isForcingVulnerabilityThresholdEnabled() && descriptor.isLockVulnerabilitySettings()) || isVulnerabilityThresholdEnabled())
-                            && isThresholdCrossed(osaThresholdConfig, cxScanResult.getOsaScanResult().getOsaHighCount(), cxScanResult.getOsaScanResult().getOsaMediumCount(), cxScanResult.getOsaScanResult().getOsaLowCount(), "OSA ");
-                }
-            }
-
-
-            generateHtmlReport(checkmarxBuildDir, cxScanResult);
-            jobConsoleLogger.info("Copying reports to workspace");
-            copyReportsToWorkspace(workspace, checkmarxBuildDir);
-
-            //If one of the scan's threshold was crossed - fail the build
-            if (isSASTThresholdFailedTheBuild || isOSAThresholdFailedTheBuild) {
-                run.setResult(thresholdConfig.getBuildStatus());
-                jobConsoleLogger.info("*************************");
-                jobConsoleLogger.info("The Build Failed due to: ");
-                jobConsoleLogger.info("*************************");
-                String[] lines = thresholdsError.toString().split("\\n");
-                for (String s : lines) {
-                    jobConsoleLogger.info(s);
-                }
-                jobConsoleLogger.info("---------------------------------------------------------------------");
-            }
-
+        if ((sastEnabled == null || sastEnabled) && isSkipScan(run)) {
+            log.info("Checkmarx scan skipped since the build was triggered by SCM. " +
+                    "Visit plugin configuration page to disable this skip.");
             return;
-        } catch (IOException | WebServiceException e) {
-            if (useUnstableOnError(descriptor)) {
-                run.setResult(Result.UNSTABLE);
-                jobConsoleLogger.error(e.getMessage(), e);
-                return;
-            } else {
-                throw e;
+        }
+
+        //resolve configuration
+        final DescriptorImpl descriptor = getDescriptor();
+        EnvVars env = run.getEnvironment(listener);
+        CxScanConfig config = resolveConfiguration(run, descriptor, env, log);
+
+        //print configuration
+        printConfiguration(config, log);
+
+        //validate at least one scan type is enabled
+        if (!config.getSastEnabled() && !config.getOsaEnabled()) {
+            log.error("Both SAST and OSA are disabled. exiting");
+            run.setResult(Result.FAILURE);
+            return;
+        }
+
+        //create scans and retrieve results (in jenkins agent)
+        CxScanCallable a = new CxScanCallable(config, listener);
+        ScanResults scanResults = workspace.act(a);
+        CxScanResult cxScanResult = new CxScanResult(run, config);
+
+        //write reports to build dir
+        File checkmarxBuildDir = new File(run.getRootDir(), "checkmarx");
+        checkmarxBuildDir.mkdir();
+
+        //in case of async mode, do not create reports (only the report of the latest scan)
+        //and don't assert threshold vulnerabilities
+        if (config.getSynchronous()) {
+            failTheBuild(run, config, scanResults);
+
+            //generate html report
+            String reportName = generateHTMLReport(workspace, checkmarxBuildDir, config, scanResults);
+            cxScanResult.setHtmlReportName(reportName);
+            run.addAction(cxScanResult);
+
+
+            //create sast reports
+            SASTResults sastResults = scanResults.getSastResults();
+            if (sastResults.isSastResultsReady()) {
+                createSastReports(sastResults, checkmarxBuildDir,workspace);
+                addEnvVarAction(run, sastResults);
+                cxScanResult.setSastResults(sastResults);
             }
-        } catch (InterruptedException e) {
-            if (reportResponse != null) {
-                jobConsoleLogger.error("Cancelling report generation on the Checkmarx server...");
-                cxWebService.cancelScanReport(reportResponse.getID());
-            } else if (cxWSResponseRunID != null) {
-                jobConsoleLogger.error("Cancelling scan on the Checkmarx server...");
-                cxWebService.cancelScan(cxWSResponseRunID.getRunId());
+
+            //create osa reports
+            OSAResults osaResults = scanResults.getOsaResults();
+            if (osaResults.isOsaResultsReady()) {
+                createOsaReports(scanResults.getOsaResults(), checkmarxBuildDir);
             }
-            throw e;
+            return;
         }
+        //Asynchronous scan - add note message and previous build reports
+        String reportName = generateHTMLReport(workspace, checkmarxBuildDir, config, scanResults);
+        cxScanResult.setHtmlReportName(reportName);
+        run.addAction(cxScanResult);
+
     }
 
+    private CxScanConfig resolveConfiguration(Run<?, ?> run, DescriptorImpl descriptor, EnvVars env, CxLoggerAdapter log) throws IOException, InterruptedException {
 
-    private void generateHtmlReport( File checkmarxBuildDir, CxScanResult cxScanResult) {
+        CxScanConfig ret = new CxScanConfig();
 
-        jobConsoleLogger.info("Generating HTML report");
-        try {
+        //general
+        ret.setCxOrigin("Jenkins");
+        ret.setDisableCertificateValidation(!descriptor.isEnableCertificateValidation());
 
-            //create output file report.html
-            File reportFile = new File(checkmarxBuildDir, "report.html");
+        //cx server
+        CxCredentials cxCredentials = CxCredentials.resolveCredentials(this, descriptor, run);
+        ret.setUrl(cxCredentials.getServerUrl().trim());
+        ret.setUsername(cxCredentials.getUsername());
+        ret.setPassword(cxCredentials.getPassword());
 
-            OutputStream output = new FileOutputStream(reportFile);
-            XMLOutput xmlOutput = XMLOutput.createXMLOutput(output);
+        //project
+        ret.setProjectName(env.expand(projectName.trim()));
+        ret.setTeamPath(teamPath);
+        ret.setTeamId(groupId);
 
-            //jelly template file to set vars in
-            InputSource jellyTemplate = new InputSource(this.getClass().getClassLoader().getResourceAsStream("com/checkmarx/jenkins/CxScanResult/summary.jelly"));
+        //scan control
+        boolean isaAsync = !isWaitForResultsEnabled() && !(descriptor.isForcingVulnerabilityThresholdEnabled() && descriptor.isLockVulnerabilitySettings());
+        ret.setSynchronous(!isaAsync);
+        ret.setDenyProject(descriptor.isProhibitProjectCreation());
 
-            //create jelly context for setting variables
-            JellyContext context = new JellyContext();
-            context.setVariable("it", cxScanResult);
-            context.setVariable("app", Jenkins.getInstance());
+        //sast
+        ret.setSastEnabled(this.sastEnabled == null || sastEnabled); //for backward compatibility, assuming if sastEnabled is not set, then sast is enabled
 
-            //run script
-            context.runScript(jellyTemplate, xmlOutput);
-            xmlOutput.flush();
-        } catch (Exception e) {
-            jobConsoleLogger.error("Failed to generate HTML report", e);
-        }
-        jobConsoleLogger.info("HTML report created successfully");
-    }
+        if (ret.getSastEnabled()) {
+            int presetId = parseInt(preset, log, "Invalid presetId: [%s]. Using default preset.", 0);
+            ret.setPresetId(presetId);
 
-    private void createOsaJsonReports(OsaScanResult osaScanResult, File checkmarxBuildDir) {
-        jobConsoleLogger.info("retrieving osa json report files");
-        File osaSummeryJsonReport = new File(checkmarxBuildDir, "OSASummery.json");
-        writeStringToWorkspaceFile("osa summery json report", osaSummeryJsonReport, osaScanResult.getOpenSourceSummaryJson());
-        File osaLibrariesJsonReport = new File(checkmarxBuildDir, "OSALibraries.json");
-        writeStringToWorkspaceFile("osa libraries json report", osaLibrariesJsonReport, osaScanResult.getOsaFullLibraryList());
-        File osaCvesJsonReport = new File(checkmarxBuildDir, "OSAVulnerabilities.json");
-        writeStringToWorkspaceFile("osa Vulnerabilities json report", osaCvesJsonReport, osaScanResult.getOsaFullCVEsList());
-    }
+            String excludeFolders = isGlobalExclusions() ? descriptor.getExcludeFolders() : getExcludeFolders();
+            String filterPattern = isGlobalExclusions() ? descriptor.getFilterPattern() : getFilterPattern();
+            ret.setSastFolderExclusions(env.expand(excludeFolders));
+            ret.setSastFilterPattern(env.expand(filterPattern));
 
+            if (descriptor.getScanTimeOutEnabled() && descriptor.getScanTimeoutDuration() > 0) {
+                ret.setSastScanTimeoutInMinutes(descriptor.getScanTimeoutDuration());
+            }
 
-    private void getOSAReports(String scanId, String serverUrl, String username, String password, File checkmarxBuildDir) {
-        jobConsoleLogger.info("retrieving osa report files");
-        AuthenticationRequest authReq = new AuthenticationRequest(username, password);
-        OsaScanClient scanClient = new OsaScanClient(serverUrl, authReq);
-        String osaScanHtmlResults = scanClient.getOSAScanHtmlResults(scanId);
-        File osaHtmlReport = new File(checkmarxBuildDir, "OSAReport.html");
-        writeStringToWorkspaceFile("osa html report", osaHtmlReport, osaScanHtmlResults);
-        byte[] osaScanPdfResults = scanClient.getOSAScanPdfResults(scanId);
-        File osaPdfReport = new File(checkmarxBuildDir, "OSAReport.pdf");
-        try {
-            FileUtils.writeByteArrayToFile(osaPdfReport, osaScanPdfResults);
-        } catch (IOException e) {
-            jobConsoleLogger.error("fail to write osa pdf report to [" + osaPdfReport.getAbsolutePath() + "]");
-        }
-        jobConsoleLogger.info("osa report file [" + osaPdfReport.getAbsolutePath() + "] generated successfully");
-    }
+            ret.setScanComment(env.expand(comment));
+            ret.setIncremental(isThisBuildIncremental(run.getNumber()));
 
-    private void writeStringToWorkspaceFile(String dataDescription, File workspaceFile, String dataString) {
-        try {
-            FileUtils.writeStringToFile(workspaceFile, dataString);
-        } catch (IOException e) {
-            jobConsoleLogger.error("fail to write " + dataDescription + " to [" + workspaceFile.getAbsolutePath() + "]");
-        }
-        jobConsoleLogger.info(dataDescription + " file [" + workspaceFile.getAbsolutePath() + "] generated successfully");
-    }
+            ret.setGeneratePDFReport(generatePdfReport);
 
-    private void printConfiguration(DescriptorImpl descriptor) {
-        StringBuilder sb = new StringBuilder();
-        boolean useGlobalThreshold = shouldUseGlobalThreshold();
-        sb.append("----------------------------Configurations:-----------------------------").append("\n");
-        if(isUseOwnServerCredentials()) {
-            sb.append("username: ").append(getUsername()).append("\n");
-            sb.append("url: ").append(getServerUrl()).append("\n");
-        }else{
-            sb.append("username: ").append(descriptor.getUsername()).append("\n");
-            sb.append("url: ").append(descriptor.getServerUrl()).append("\n");
-        }
-        sb.append("projectName: ").append(getProjectName()).append("\n");
-        //sb.append("preset: ").append(getPreset()).append("\n");
-        sb.append("isIncrementalScan: ").append(isIncremental()).append("\n");
-        if (isGlobalExclusions()) {
-            sb.append("folderExclusions: ").append(descriptor.getExcludeFolders()).append("\n");
-        }else{
-            sb.append("folderExclusions: ").append(getExcludeFolders()).append("\n");
+            int configurationId = parseInt(sourceEncoding, log, "Invalid source encoding (configuration) value: [%s]. Using default configuration.", 1);
+            ret.setEngineConfigurationId(configurationId);
 
-        }
-        sb.append("isSynchronous: ").append(isWaitForResultsEnabled()).append("\n"); //TODO GLOBAL
-        sb.append("generatePDFReport: ").append(isGeneratePdfReport()).append("\n");
-        if (useGlobalThreshold) {
-            sb.append("highSeveritiesThreshold: ").append(descriptor.getHighThresholdEnforcement()).append("\n");
-            sb.append("mediumSeveritiesThreshold: ").append(descriptor.getMediumThresholdEnforcement()).append("\n");
-            sb.append("lowSeveritiesThreshold: ").append(descriptor.getLowThresholdEnforcement()).append("\n");
-        } else if (isSASThresholdEffectivelyEnabled()) {
-            sb.append("highSeveritiesThreshold: ").append(getHighThreshold()).append("\n");
-            sb.append("mediumSeveritiesThreshold: ").append(getMediumThreshold()).append("\n");
-            sb.append("lowSeveritiesThreshold: ").append(getLowThreshold()).append("\n");
-        }
-        sb.append("osaEnabled: ").append(isOsaEnabled()).append("\n");
-        if (osaEnabled) {
-            sb.append("osaExclusions: ").append(getExcludeOpenSourceFolders()).append("\n");
+            boolean useGlobalThreshold = shouldUseGlobalThreshold();
+            boolean useJobThreshold = shouldUseJobThreshold();
+            ret.setSastThresholdsEnabled(useGlobalThreshold || useJobThreshold);
+
             if (useGlobalThreshold) {
-                sb.append("osaHighSeveritiesThreshold: ").append(descriptor.getOsaHighThresholdEnforcement()).append("\n");
-                sb.append("osaMediumSeveritiesThreshold: ").append(descriptor.getOsaMediumThresholdEnforcement()).append("\n");
-                sb.append("osaLowSeveritiesThreshold: ").append(descriptor.getOsaLowThresholdEnforcement()).append("\n");
-            } else if (isOsaThresholdEffectivelyEnabled()) {
-                sb.append("osaHighSeveritiesThreshold: ").append(getOsaHighThreshold()).append("\n");
-                sb.append("osaMediumSeveritiesThreshold: ").append(getOsaMediumThreshold()).append("\n");
-                sb.append("osaLowSeveritiesThreshold: ").append(getOsaLowThreshold()).append("\n");
+                ret.setSastHighThreshold(descriptor.getHighThresholdEnforcement());
+                ret.setSastMediumThreshold(descriptor.getMediumThresholdEnforcement());
+                ret.setSastLowThreshold(descriptor.getLowThresholdEnforcement());
+                resolvedVulnerabilityThresholdResult = Result.fromString(descriptor.getJobGlobalStatusOnThresholdViolation().name());
+            }
+
+            else if (useJobThreshold) {
+                ret.setSastHighThreshold(getHighThreshold());
+                ret.setSastMediumThreshold(getMediumThreshold());
+                ret.setSastLowThreshold(getLowThreshold());
+                ret.setSastNewResultsThresholdEnabled(failBuildOnNewResults);
+                ret.setSastNewResultsThresholdSeverity(failBuildOnNewSeverity);
+                resolvedVulnerabilityThresholdResult = vulnerabilityThresholdResult;
             }
         }
-        sb.append(" ------------------------------------------------------------------------").append("\n");
 
-        jobConsoleLogger.info(sb.toString());
-    }
+        //osa
+        ret.setOsaEnabled(osaEnabled);
+        if (osaEnabled) {
+            ret.setOsaFolderExclusions(env.expand(excludeOpenSourceFolders));
+            ret.setOsaFilterPattern(env.expand(includeOpenSourceFolders));
+            ret.setOsaArchiveIncludePatterns(osaArchiveIncludePatterns);
+            ret.setOsaRunInstall(osaInstallBeforeScan);
+            ret.setEnablePolicyViolations(enableProjectPolicyEnforcement);
 
-    private boolean isSASThresholdEffectivelyEnabled() {
-        DescriptorImpl descriptor = getDescriptor();
-        if (shouldUseGlobalThreshold() && (descriptor.getHighThresholdEnforcement() != null || descriptor.getMediumThresholdEnforcement() != null || descriptor.getLowThresholdEnforcement() != null)) {
-            return true;
-        } else if (this.isVulnerabilityThresholdEnabled() && (this.getHighThreshold() != null && this.getMediumThreshold() != null && this.getLowThreshold() != null)){
-            return true;
+            boolean useGlobalThreshold = shouldUseGlobalThreshold();
+            boolean useJobThreshold = shouldUseJobThreshold();
+            ret.setOsaThresholdsEnabled(useGlobalThreshold || useJobThreshold);
+
+            if (useGlobalThreshold) {
+                ret.setOsaHighThreshold(descriptor.getOsaHighThresholdEnforcement());
+                ret.setOsaMediumThreshold(descriptor.getOsaMediumThresholdEnforcement());
+                ret.setOsaLowThreshold(descriptor.getOsaLowThresholdEnforcement());
+            }
+
+            else if (useJobThreshold) {
+                ret.setOsaHighThreshold(getOsaHighThreshold());
+                ret.setOsaMediumThreshold(getOsaMediumThreshold());
+                ret.setOsaLowThreshold(getOsaLowThreshold());
+            }
         }
-        return false;
+
+        return ret;
     }
 
-    private boolean isOsaThresholdEffectivelyEnabled() {
-        DescriptorImpl descriptor = getDescriptor();
-        if (shouldUseGlobalThreshold() && (descriptor.getOsaHighThresholdEnforcement() != null || descriptor.getOsaMediumThresholdEnforcement() != null || descriptor.getOsaLowThresholdEnforcement() != null)) {
-            return true;
-        } else if (this.isVulnerabilityThresholdEnabled() && (this.getOsaHighThreshold() != null && this.getOsaMediumThreshold() != null && this.getOsaLowThreshold() != null)){
-            return true;
+    private void printConfiguration(CxScanConfig config, CxLoggerAdapter log) {
+        log.info("---------------------------------------Configurations:------------------------------------");
+        log.info("plugin version: " + CxConfig.version());
+        log.info("server url: " + config.getUrl());
+        log.info("username: " + config.getUsername());
+        log.info("project name: " + config.getProjectName());
+        log.info("team path: " + config.getTeamPath());
+        log.info("team id: " + config.getTeamId());
+        log.info("is synchronous mode: " + config.getSynchronous());
+        log.info("deny project creation: " + config.getDenyProject());
+        log.info("SAST scan enabled: " + config.getSastEnabled());
+        log.info("Enable Project Policy Enforcement: " + config.getEnablePolicyViolations());
+        if (config.getSastEnabled()) {
+            log.info("preset id: " + config.getPresetId());
+            log.info("SAST folder exclusions: " + config.getSastFolderExclusions());
+            log.info("SAST filter pattern: " + config.getSastFilterPattern());
+            log.info("SAST timeout: " + config.getSastScanTimeoutInMinutes());
+            log.info("SAST scan comment: " + config.getScanComment());
+            log.info("is incremental scan: " + config.getIncremental());
+            log.info("is generate pfd report: " + config.getGeneratePDFReport());
+            log.info("source code encoding id: " + config.getEngineConfigurationId());
+            log.info("SAST thresholds enabled: " + config.getSastThresholdsEnabled());
+            if (config.getSastThresholdsEnabled()) {
+                log.info("SAST high threshold: " + config.getSastHighThreshold());
+                log.info("SAST medium threshold: " + config.getSastMediumThreshold());
+                log.info("SAST low threshold: " + config.getSastLowThreshold());
+            }
         }
-        return false;
+
+        log.info("OSA scan enabled: " + config.getOsaEnabled());
+        if (config.getOsaEnabled()) {
+            log.info("OSA folder exclusions: " + config.getOsaFolderExclusions());
+            log.info("OSA filter patterns: " + config.getOsaFilterPattern());
+            log.info("OSA archive includes: " + config.getOsaArchiveIncludePatterns());
+            log.info("OSA run Execute dependency managers install packages command before Scan: " + config.getOsaRunInstall());
+            log.info("OSA thresholds enabled: " + config.getOsaThresholdsEnabled());
+            if (config.getOsaThresholdsEnabled()) {
+                log.info("OSA high threshold: " + config.getOsaHighThreshold());
+                log.info("OSA medium threshold: " + config.getOsaMediumThreshold());
+                log.info("OSA low threshold: " + config.getOsaLowThreshold());
+            }
+        }
+        log.info("------------------------------------------------------------------------------------------");
     }
 
-    private void printScanResult(CxScanResult scanResult) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("\n---------------------Checkmarx Scan Results(CxSAST)-------------------------").append("\n");
-        sb.append("High Severity Results: ").append(scanResult.getHighCount()).append("\n");
-        sb.append("Medium Severity Results: ").append(scanResult.getMediumCount()).append("\n");
-        sb.append("Low Severity Results: ").append(scanResult.getLowCount()).append("\n");
-        sb.append("Info Severity Results: ").append(scanResult.getInfoCount()).append("\n");
-        sb.append("----------------------------------------------------------------------------").append("\n");
+    private void createSastReports(SASTResults sastResults, File checkmarxBuildDir,@Nonnull FilePath workspace) {
+        File xmlReportFile = new File(checkmarxBuildDir, SCAN_REPORT_XML);
+        try {
+            FileUtils.writeByteArrayToFile(xmlReportFile, sastResults.getRawXMLReport());
+            writeFileToWorkspaceReports(workspace, xmlReportFile);
+        } catch (IOException e) {
+            log.warn("Failed to write SAST XML report to workspace: " + e.getMessage());
+        }
 
-        jobConsoleLogger.info(sb.toString());
+        if (sastResults.getPDFReport() != null) {
+            File pdfReportFile = new File(checkmarxBuildDir, CxScanResult.PDF_REPORT_NAME);
+            try {
+                FileUtils.writeByteArrayToFile(pdfReportFile, sastResults.getPDFReport());
+            } catch (IOException e) {
+                log.warn("Failed to write SAST PDF report to workspace: " + e.getMessage());
+            }
+        }
     }
 
-    private void copyReportsToWorkspace(FilePath workspace, File checkmarxBuildDir) {
+    private void createOsaReports(OSAResults osaResults, File checkmarxBuildDir) {
+        writeJsonObjectToFile(osaResults.getResults(), new File(checkmarxBuildDir, OSA_SUMMERY_JSON), "OSA summery json report");
+        writeJsonObjectToFile(osaResults.getOsaLibraries(), new File(checkmarxBuildDir, OSA_LIBRARIES_JSON), "OSA libraries json report");
+        writeJsonObjectToFile(osaResults.getOsaVulnerabilities(), new File(checkmarxBuildDir, OSA_VULNERABILITIES_JSON), "OSA vulnerabilities json report");
+    }
+
+    private String generateHTMLReport(@Nonnull FilePath workspace, File checkmarxBuildDir, CxScanConfig config, ScanResults results) {
+        String reportName = null;
+        try {
+            String reportHTML = SummaryUtils.generateSummary(results.getSastResults(), results.getOsaResults(), config);
+            reportName = CxScanResult.resolveHTMLReportName(config.getSastEnabled(), config.getOsaEnabled());
+            File reportFile = new File(checkmarxBuildDir, reportName);
+            FileUtils.writeStringToFile(reportFile, reportHTML, Charset.defaultCharset());
+            writeFileToWorkspaceReports(workspace, reportFile);
+        } catch (IOException | TemplateException e) {
+            log.warn("Failed to generate HTML report: " + e.getMessage());
+        }
+        return reportName;
+
+    }
+
+    private void writeJsonObjectToFile(Object jsonObj, File to, String description) {
+        try {
+            ObjectMapper objectMapper = new ObjectMapper();
+            String json = null;
+            json = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(jsonObj);
+            FileUtils.writeStringToFile(to, json);
+            //log.info(description + " file generated successfully. location: [" + to.getAbsolutePath() + "]");
+            log.info("Copying file [" + to.getName() + "] to workspace [" + to.getAbsolutePath() + "]");
+        } catch (Exception e) {
+            log.error("Failed to write " + description + " to [" + to.getAbsolutePath() + "]");
+
+        }
+    }
+
+    private boolean failTheBuild(Run<?, ?> run, CxScanConfig config, ScanResults scanResults) {
+
+        Exception sastCreateException = scanResults.getSastCreateException();
+        Exception sastWaitException = scanResults.getSastWaitException();
+        Exception osaCreateException = scanResults.getOsaCreateException();
+        Exception osaWaitException = scanResults.getOsaWaitException();
+
+        //assert vulnerabilities
+        StringBuilder failDescription = new StringBuilder();
+        boolean thresholdExceeded = false;
+        boolean sastNewResultsExceeded = false;
+        boolean isPolicyViolated = false;
+
+
+        if (config.getSynchronous()) {
+            thresholdExceeded = ShragaUtils.isThresholdExceeded(config, scanResults.getSastResults(), scanResults.getOsaResults(),  failDescription);
+            sastNewResultsExceeded = ShragaUtils.isThresholdForNewResultExceeded(config, scanResults.getSastResults(),  failDescription);
+            isPolicyViolated = isPolicyViolated(config,scanResults.getOsaResults(), failDescription);
+        }
+
+        boolean fail = sastCreateException != null || sastWaitException != null || osaCreateException != null || osaWaitException != null;
+        fail = fail || thresholdExceeded || sastNewResultsExceeded || isPolicyViolated;
+
+        if (fail) {
+
+            if (useUnstableOnError(getDescriptor())) {
+                run.setResult(Result.UNSTABLE);
+            }else {
+                run.setResult(Result.FAILURE);
+            }
+
+            log.error("********************************************");
+            log.error(" The Build Failed for the Following Reasons:");
+            log.error("********************************************");
+
+            if (sastCreateException != null) {
+                log.error("Failed to create SAST scan: " + sastCreateException);
+            }
+
+            if (sastWaitException != null) {
+                log.error("Failed to get SAST scan results: " + sastWaitException);
+            }
+
+            if (osaCreateException != null) {
+                log.error("Failed to create OSA scan: " + osaCreateException);
+            }
+
+            if (osaWaitException != null) {
+                log.error("Failed to get OSA scan results: " + osaWaitException);
+            }
+
+            if ( failDescription.length() > 0) {
+                String[] lines =  failDescription.toString().split("\\n");
+                for (String s : lines) {
+                    log.error(s);
+                }
+                if(resolvedVulnerabilityThresholdResult != null) {
+                    run.setResult(resolvedVulnerabilityThresholdResult);
+                }
+            }
+        }
+
+        return fail;
+    }
+
+    public boolean isPolicyViolated(CxScanConfig config, OSAResults osaResults, StringBuilder failDescription) {
+        boolean isPolicyViolated = config.getEnablePolicyViolations() && osaResults.getOsaViolations().size() > 0;
+        if(isPolicyViolated) {
+            failDescription.append(CxGlobalMessage.PROJECT_POLICY_VIOLATED_STATUS.getMessage()).append("\n");
+        }
+        return isPolicyViolated;
+    }
+
+    private void addEnvVarAction(Run<?, ?> run, SASTResults sastResults) {
+        EnvVarAction envVarAction = new EnvVarAction();
+        envVarAction.setCxSastResults(sastResults.getHigh(),
+                sastResults.getMedium(),
+                sastResults.getLow(),
+                sastResults.getInformation());
+        run.addAction(envVarAction);
+    }
+
+    private int parseInt(String number, CxLoggerAdapter log, String templateMessage, int defaultVal) {
+        int ret = defaultVal;
+        try {
+            ret = Integer.parseInt(number);
+        } catch (Exception e) {
+            log.warn(String.format(templateMessage, number));
+        }
+        return ret;
+    }
+
+    private void writeFileToWorkspaceReports(FilePath workspace, File file) {
 
         String remoteDirPath = workspace.getRemote() + "/" + REPORTS_FOLDER;
+        FileInputStream fis = null;
 
-        Collection<File> files = FileUtils.listFiles(checkmarxBuildDir, null, true);
-        FileInputStream fileInputStream = null;
+        try {
+            String remoteFilePath = remoteDirPath + "/" + file.getName();
+            log.info("Copying file [" + file.getName() + "] to workspace [" + remoteFilePath + "]");
+            FilePath remoteFile = new FilePath(workspace.getChannel(), remoteFilePath);
+            fis = new FileInputStream(file);
+            remoteFile.copyFrom(fis);
 
-        for (File file : files) {
-            try {
-                String remoteFilePath = remoteDirPath + "/" + file.getName();
-                jobConsoleLogger.info("Copying file [" + file.getName() + "] to workspace [" + remoteFilePath + "]");
-                FilePath remoteFile = new FilePath(workspace.getChannel(), remoteFilePath);
-                fileInputStream = new FileInputStream(file);
-                remoteFile.copyFrom(fileInputStream);
+        } catch (Exception e) {
+            log.warn("Failed to write file [" + file.getName() + "] to workspace: " + e.getMessage());
 
-            } catch (Exception e) {
-                jobConsoleLogger.error("fail to copy file [" + file.getName() + "] to workspace", e);
-
-            } finally {
-                IOUtils.closeQuietly(fileInputStream);
-            }
-        }
-    }
-
-    @NotNull
-    private CxScanResult addScanResultAction(Run<?, ?> run, String serverUrlToUse, boolean shouldRunAsynchronous, File xmlReportFile) {
-        CxScanResult cxScanResult = new CxScanResult(run, serverUrlToUse, projectId, shouldRunAsynchronous);
-        if (xmlReportFile != null) {
-            SastResultParser sastResultParser = new SastResultParser(jobConsoleLogger, serverUrlToUse);
-            SastScanResult sastScanResult = sastResultParser.readScanXMLReport(xmlReportFile);
-            cxScanResult.setSastScanResult(sastScanResult);
-        }
-        run.addAction(cxScanResult);
-        return cxScanResult;
-    }
-
-    private void logAsyncMessage(String serverUrlToUse) {
-        String projectStateUrl = serverUrlToUse + PROJECT_STATE_URL_TEMPLATE.replace("{0}", Long.toString(projectId));
-        String projectStateLink = HyperlinkNote.encodeTo(projectStateUrl, "CxSAST Web");
-        jobConsoleLogger.info(ASYNC_MESSAGE.replace("{0}", projectStateLink));
-    }
-
-    private boolean scanShouldRunAsynchronous(DescriptorImpl descriptor) {
-        return !isWaitForResultsEnabled() && !(descriptor.isForcingVulnerabilityThresholdEnabled() && descriptor.isLockVulnerabilitySettings());
-    }
-
-    private OsaScanResult analyzeOpenSources(Run<?, ?> run, FilePath workspace, String baseUri, String user, String password, CxWebService webServiceClient, TaskListener listener, boolean shouldRunAsynchronous) {
-        AuthenticationRequest authReq = new AuthenticationRequest(user, password);
-            OsaScanClient scanClient = new OsaScanClient(baseUri, authReq);
-            ScanServiceTools scanServiceTools = initScanServiceTools(scanClient, run, workspace, webServiceClient, listener);
-            ScanService scanService = new ScanService(scanServiceTools);
-            return scanService.scan(shouldRunAsynchronous);
-    }
-
-    private ScanServiceTools initScanServiceTools(OsaScanClient scanClient, Run<?, ?> run, FilePath workspace, CxWebService webServiceClient, TaskListener listener) {
-        ScanServiceTools scanServiceTools = new ScanServiceTools();
-        scanServiceTools.setOsaScanClient(scanClient);
-        DependencyFolder folders = new DependencyFolder(includeOpenSourceFolders, excludeOpenSourceFolders);
-        scanServiceTools.setDependencyFolder(folders);
-        scanServiceTools.setRun(run);
-        scanServiceTools.setListener(listener);
-        scanServiceTools.setProjectId(projectId);
-        scanServiceTools.setWebServiceClient(webServiceClient);
-        scanServiceTools.setWorkspace(workspace);
-        return scanServiceTools;
-    }
-
-    private ThresholdConfig createThresholdConfig() {
-        ThresholdConfig config = new ThresholdConfig();
-
-        if (shouldUseGlobalThreshold()) {
-            final DescriptorImpl descriptor = getDescriptor();
-            config.setHighSeverity(descriptor.getHighThresholdEnforcement());
-            config.setMediumSeverity(descriptor.getMediumThresholdEnforcement());
-            config.setLowSeverity(descriptor.getLowThresholdEnforcement());
-            config.setBuildStatus(Result.fromString(descriptor.getJobGlobalStatusOnThresholdViolation().name()));
-        } else {
-            config.setHighSeverity(getHighThreshold());
-            config.setMediumSeverity(getMediumThreshold());
-            config.setLowSeverity(getLowThreshold());
-            config.setBuildStatus(vulnerabilityThresholdResult);
+        } finally {
+            IOUtils.closeQuietly(fis);
         }
 
-        return config;
-    }
-
-    private ThresholdConfig createOsaThresholdConfig() {
-        ThresholdConfig config = new ThresholdConfig();
-        if (shouldUseGlobalThreshold()) {
-            final DescriptorImpl descriptor = getDescriptor();
-            config.setHighSeverity(descriptor.getOsaHighThresholdEnforcement());
-            config.setMediumSeverity(descriptor.getOsaMediumThresholdEnforcement());
-            config.setLowSeverity(descriptor.getOsaLowThresholdEnforcement());
-        } else {
-            config.setHighSeverity(getOsaHighThreshold());
-            config.setMediumSeverity(getOsaMediumThreshold());
-            config.setLowSeverity(getOsaLowThreshold());
-        }
-        return config;
     }
 
     private boolean shouldUseGlobalThreshold() {
         final DescriptorImpl descriptor = getDescriptor();
-        return descriptor.isForcingVulnerabilityThresholdEnabled() && descriptor.isLockVulnerabilitySettings() || "global".equals(getThresholdSettings());
+        //locked by global or (job threshold enabled and points to 'global' and global is enabled)
+        return (descriptor.isForcingVulnerabilityThresholdEnabled() && descriptor.isLockVulnerabilitySettings()) || (isVulnerabilityThresholdEnabled() && "global".equals(getThresholdSettings()) && descriptor.isForcingVulnerabilityThresholdEnabled());
     }
 
+    private boolean shouldUseJobThreshold() {
+        final DescriptorImpl descriptor = getDescriptor();
+        //not locked by global and job threshold enabled and points to 'job'
+        return !(descriptor.isForcingVulnerabilityThresholdEnabled() && descriptor.isLockVulnerabilitySettings()) && isVulnerabilityThresholdEnabled();
+    }
 
     /**
      * Checks if job should fail with <code>UNSTABLE</code> status instead of <code>FAILED</code>
@@ -1065,115 +1067,6 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         return JobStatusOnError.UNSTABLE.equals(getJobStatusOnError())
                 || (JobStatusOnError.GLOBAL.equals(getJobStatusOnError()) && JobGlobalStatusOnError.UNSTABLE.equals(descriptor
                 .getJobGlobalStatusOnError()));
-    }
-
-    private boolean isThresholdCrossed(ThresholdConfig thresholdConfig, int high, int medium, int low, String scanType) {
-        boolean ret = isThresholdCrossedByLevel(high, thresholdConfig.getHighSeverity(), scanType + "high");
-        ret |= isThresholdCrossedByLevel(medium, thresholdConfig.getMediumSeverity(), scanType + "medium");
-        ret |= isThresholdCrossedByLevel(low, thresholdConfig.getLowSeverity(), scanType + "low");
-        return ret;
-    }
-
-    private boolean isThresholdCrossedByLevel(int result, Integer threshold, String vulnerabilityLevel) {
-        boolean ret = false;
-        if (threshold != null && result > threshold) {
-            thresholdsError.append(vulnerabilityLevel + " Severity Results are Above Threshold. Results: " + result + ". Threshold: " + threshold + '\n');
-            ret = true;
-        }
-        return ret;
-    }
-
-    private String instanceLoggerSuffix(final AbstractBuild<?, ?> build) {
-        return build.getProject().getDisplayName() + "-" + build.getDisplayName();
-    }
-
-
-    private CxWSResponseRunID submitScan(final Run<?, ?> run, FilePath workspace, final CxWebService cxWebService, final TaskListener listener) throws IOException {
-
-        FilePath zipFile = null;
-
-        try {
-            EnvVars env = run.getEnvironment(listener);
-            final CliScanArgs cliScanArgs = createCliScanArgs(new byte[]{}, env);
-            checkIncrementalScan(run);
-            zipFile = zipWorkspaceFolder(run, workspace, listener);
-            SastScan sastScan = new SastScan(cxWebService, cliScanArgs, new ProjectContract(cxWebService));
-            CxWSResponseRunID cxWSResponseRunId = sastScan.scan(getGroupId(), zipFile, isThisBuildIncremental);
-            zipFile.delete();
-            jobConsoleLogger.info("Temporary file deleted");
-            jobConsoleLogger.info("\nScan job submitted successfully\n");
-            return cxWSResponseRunId;
-
-        } catch (Zipper.MaxZipSizeReached e) {
-            throw new AbortException("Checkmarx Scan Failed: When zipping file " + e.getCurrentZippedFileName() + ", reached maximum upload size limit of "
-                    + FileUtils.byteCountToDisplaySize(CxConfig.maxZipSize()) + "\n");
-        } catch (Zipper.NoFilesToZip e) {
-            exposeZippingLogToJobConsole(e);
-            throw new AbortException("Checkmarx Scan Failed: No files to scan");
-
-        } catch (Zipper.ZipperException e) {
-            exposeZippingLogToJobConsole(e);
-            throw new AbortException("Checkmarx Scan Failed: "+ e.getMessage());
-
-        } catch (InterruptedException e) {
-            throw new AbortException("Remote operation failed on slave node: " + e.getMessage());
-
-        }  finally {
-            if(zipFile != null) {
-                try {
-                    if (zipFile.exists()) {
-                        if (zipFile.delete()) {
-                            jobConsoleLogger.info("Temporary file deleted");
-                        } else {
-                            jobConsoleLogger.info("Fail to delete temporary file");
-                        }
-                    }
-                } catch (Exception e) {
-                    jobConsoleLogger.error("Fail to delete temporary file", e);
-                }
-            }
-        }
-    }
-
-    private void exposeZippingLogToJobConsole(Zipper.ZipperException zipperException){
-        jobConsoleLogger.info(zipperException.getZippingDetails().getZippingLog());
-    }
-
-    private boolean needToAvoidDuplicateProjectScans(CxWebService cxWebService) throws AbortException {
-        return avoidDuplicateProjectScans && projectHasQueuedScans(cxWebService);
-    }
-
-    private void checkIncrementalScan(Run<?, ?> run) {
-        isThisBuildIncremental = isThisBuildIncremental(run.getNumber());
-
-        if (isThisBuildIncremental) {
-            jobConsoleLogger.info("\nScan job started in incremental scan mode\n");
-        } else {
-            jobConsoleLogger.info("\nScan job started in full scan mode\n");
-        }
-    }
-
-    private FilePath zipWorkspaceFolder(Run<?, ?> run, FilePath workspace, TaskListener listener) throws IOException, InterruptedException {
-        FolderPattern folderPattern = new FolderPattern(run, listener);
-        DescriptorImpl descriptor = getDescriptor();
-        String excludeFolders = isGlobalExclusions()? descriptor.getExcludeFolders(): getExcludeFolders() ;
-        String filterPattern = isGlobalExclusions()? descriptor.getFilterPattern():getFilterPattern();
-
-        String combinedFilterPattern = folderPattern.generatePattern(filterPattern, excludeFolders);
-
-        CxZip cxZip = new CxZip(workspace, listener);
-        return cxZip.ZipWorkspaceFolder(combinedFilterPattern);
-    }
-
-    private boolean projectHasQueuedScans(final CxWebService cxWebService) throws AbortException {
-        ProjectContract projectContract = new ProjectContract(cxWebService);
-        return projectContract.projectHasQueuedScans(projectId);
-    }
-
-
-    private CliScanArgs createCliScanArgs(byte[] compressedSources, EnvVars env) {
-        CliScanArgsFactory cliScanArgsFactory = new CliScanArgsFactory(getPreset(), getProjectName(), getGroupId(), getSourceEncoding(), getComment(), isThisBuildIncremental, compressedSources, env, projectId, jobConsoleLogger);
-        return cliScanArgsFactory.create();
     }
 
     private boolean isThisBuildIncremental(int buildNumber) {
@@ -1236,9 +1129,10 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
     public static final class DescriptorImpl extends BuildStepDescriptor<Builder> {
 
         public static final String DEFAULT_FILTER_PATTERNS = CxConfig.defaultFilterPattern();
+        public static final String DEFAULT_OSA_ARCHIVE_INCLUDE_PATTERNS = CxConfig.getDefaultOsaArchiveIncludePatterns();
+
         public static final int FULL_SCAN_CYCLE_MIN = 1;
         public static final int FULL_SCAN_CYCLE_MAX = 99;
-
 
         //////////////////////////////////////////////////////////////////////////////////////
         //  Persistent plugin global configuration parameters
@@ -1250,6 +1144,8 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         private String username;
         @Nullable
         private String password;
+
+        private String credentialsId;
 
         private boolean prohibitProjectCreation;
         private boolean hideResults;
@@ -1276,7 +1172,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         private JobGlobalStatusOnError jobGlobalStatusOnError;
         private JobGlobalStatusOnError jobGlobalStatusOnThresholdViolation = JobGlobalStatusOnError.FAILURE;
         private boolean scanTimeOutEnabled;
-        private double scanTimeoutDuration; // In Hours.
+        private Integer scanTimeoutDuration; // In minutes.
         private boolean lockVulnerabilitySettings = true;
 
         private final transient Pattern msGuid = Pattern.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
@@ -1323,6 +1219,14 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             return Secret.fromString(password).getPlainText();
         }
 
+        public String getCredentialsId() {
+            return credentialsId;
+        }
+
+        public void setCredentialsId(String credentialsId) {
+            this.credentialsId = credentialsId;
+        }
+
         public boolean isProhibitProjectCreation() {
             return prohibitProjectCreation;
         }
@@ -1352,8 +1256,6 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 	            the requirement to restart the Jenkins server for configuration to take
 	            effect.
 	             */
-
-                CxSSLUtility.enableSSLCertificateVerification(STATIC_LOGGER);
             }
             this.enableCertificateValidation = enableCertificateValidation;
         }
@@ -1442,19 +1344,17 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         public void setScanTimeOutEnabled(boolean scanTimeOutEnabled) {
             this.scanTimeOutEnabled = scanTimeOutEnabled;
         }
-
-        public int getScanTimeoutDuration() {
-            if (!timeoutValid(scanTimeoutDuration)) {
-                scanTimeoutDuration = 1;
-            }
-
-            return (int) Math.round(scanTimeoutDuration * 60);
+        @Nullable
+        public Integer getScanTimeoutDuration() {
+            return scanTimeoutDuration;
         }
 
-        public void setScanTimeoutDuration(int scanTimeoutDurationInMinutes) {
-            if (timeoutValid(scanTimeoutDurationInMinutes)) {
-                this.scanTimeoutDuration = scanTimeoutDurationInMinutes / (double) 60;
-            }
+        public void setScanTimeoutDuration(@Nullable Integer scanTimeoutDurationInMinutes) {
+            this.scanTimeoutDuration = scanTimeoutDurationInMinutes;
+        }
+
+        public FormValidation doCheckScanTimeoutDuration(@QueryParameter final Integer value) {
+            return timeoutValid(value);
         }
 
         @Override
@@ -1470,12 +1370,11 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         // Provides a description string to be displayed near "Use default server credentials"
         // configuration option
         public String getCredentialsDescription() {
-            if (getServerUrl() == null || getServerUrl().isEmpty() ||
-                    getUsername() == null || getUsername().isEmpty()) {
+            if (getServerUrl() == null || getServerUrl().isEmpty()) {
                 return "not set";
             }
 
-            return "Server URL: " + getServerUrl() + " username: " + getUsername();
+            return "Server URL: " + getServerUrl();
 
         }
 
@@ -1490,92 +1389,52 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         //////////////////////////////////////////////////////////////////////////////////////
         // Field value validators
         //////////////////////////////////////////////////////////////////////////////////////
-
-        /*
-         *  Note: This method is called concurrently by multiple threads, refrain from using mutable
-	     *  shared state to avoid synchronization issues.
-	     */
-        public FormValidation doCheckOsaEnabled(@QueryParameter final boolean useOwnServerCredentials, @QueryParameter final String serverUrl, @QueryParameter final String password,
-                                                @QueryParameter final String username, @QueryParameter final boolean osaEnabled, @QueryParameter final String timestamp) {
-            // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
-            CxWebService cxWebService = null;
-
-            if (!osaEnabled) {
-                return FormValidation.ok();
-            }
-
-            try {
-                cxWebService = prepareLoggedInWebservice(useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password));
-            } catch (Exception e) {
-                 STATIC_LOGGER.error(e.getMessage(), e);
-                return FormValidation.ok();
-            }
-
-            try {
-                Boolean isOsaLicenseValid = cxWebService.isOsaLicenseValid();
-                if (!isOsaLicenseValid) {
-                    return FormValidation.error(ScanService.NO_LICENSE_ERROR);
-                }
-                return FormValidation.ok();
-
-            } catch (Exception e) {
-                return FormValidation.error(e.getMessage());
-            }
-        }
-
-
-        private boolean timeoutValid(double timeInput) {
-            return timeInput >= MINIMUM_TIMEOUT_IN_MINUTES;
-        }
-
-        private boolean osaConfigured(String includeOpenSourceFolders) {
-            return !org.apache.commons.lang.StringUtils.isEmpty(includeOpenSourceFolders);
-        }
-
-
         /*
          *  Note: This method is called concurrently by multiple threads, refrain from using mutable
 	     *  shared state to avoid synchronization issues.
 	     */
         public FormValidation doTestConnection(@QueryParameter final String serverUrl, @QueryParameter final String password,
-                                               @QueryParameter final String username, @QueryParameter final String timestamp) {
+                                               @QueryParameter final String username, @QueryParameter final String timestamp, @QueryParameter final String credentialsId, @AncestorInPath Item item) {
             // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
-            CxWebService cxWebService = null;
+
+            CxCredentials cred = null;
+            CxShragaClient shragaClient = null;
             try {
-                cxWebService = new CxWebService(serverUrl, STATIC_LOGGER);
+                cred = CxCredentials.resolveCredentials(true, serverUrl, username, getPasswordPlainText(password), credentialsId, this, item);
+                CxCredentials.validateCxCredentials(cred);
+                shragaClient = new CxShragaClient(cred.getServerUrl(), cred.getUsername(), cred.getPassword(), CX_ORIGIN, !this.isEnableCertificateValidation(), serverLog);
             } catch (Exception e) {
-                 STATIC_LOGGER.error(e.getMessage(), e);
-                return FormValidation.error(e.getMessage());
+                return buildError(e, "Failed to init cx client");
             }
 
             try {
-                cxWebService.login(username, getPasswordPlainText(password));
+                shragaClient.login();
                 return FormValidation.ok("Success");
 
+            } catch (UnknownHostException e) {
+                return buildError(e, "Failed to login to Chekmarx server");
+
             } catch (Exception e) {
-                return FormValidation.error(e.getMessage());
+                return buildError(e, "Failed to login to Chekmarx server");
+
             }
         }
 
-        // Prepares a this.cxWebService object to be connected and logged in
+        private FormValidation buildError(Exception e, String errorLogMessage) {
+            serverLog.error(errorLogMessage, e);
+            return FormValidation.error(e.getMessage());
+        }
+
+        // Prepares a cx client object to be connected and logged in
         /*
          *  Note: This method is called concurrently by multiple threads, refrain from using mutable
 	     *  shared state to avoid synchronization issues.
 	     */
-        private CxWebService prepareLoggedInWebservice(boolean useOwnServerCredentials,
-                                                       String serverUrl,
-                                                       String username,
-                                                       String password)
-                throws AbortException, MalformedURLException {
-            String serverUrlToUse = !useOwnServerCredentials ? serverUrl : getServerUrl();
-            String usernameToUse = !useOwnServerCredentials ? username : getUsername();
-            String passwordToUse = !useOwnServerCredentials ? getPasswordPlainText(password) : getPasswordPlainText();
-
-            STATIC_LOGGER.info("prepareLoggedInWebservice: server: " + serverUrlToUse + " user: " + usernameToUse);
-
-            CxWebService cxWebService = new CxWebService(serverUrlToUse, STATIC_LOGGER);
-            cxWebService.login(usernameToUse, passwordToUse);
-            return cxWebService;
+        private CxShragaClient prepareLoggedInClient(CxCredentials credentials)
+                throws IOException, CxClientException, CxTokenExpiredException {
+            CxShragaClient ret = new CxShragaClient(credentials.getServerUrl(), credentials.getUsername(), credentials.getPassword(), CX_ORIGIN, !this.isEnableCertificateValidation(), serverLog);
+            ret.login();
+            return ret;
         }
 
         /*
@@ -1583,76 +1442,26 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
          *  shared state to avoid synchronization issues.
          */
         public ComboBoxModel doFillProjectNameItems(@QueryParameter final boolean useOwnServerCredentials, @QueryParameter final String serverUrl,
-                                                    @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp) {
+                                                    @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp, @QueryParameter final String credentialsId, @AncestorInPath Item item) {
             // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
             ComboBoxModel projectNames = new ComboBoxModel();
 
             try {
-                final CxWebService cxWebService = prepareLoggedInWebservice(useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password));
+                CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password), credentialsId, this, item);
+                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
+                List<Project> projects = shragaClient.getAllProjects();
 
-                List<ProjectDisplayData> projectsDisplayData = cxWebService.getProjectsDisplayData();
-                for (ProjectDisplayData pd : projectsDisplayData) {
-                    projectNames.add(pd.getProjectName());
+                for (Project p : projects) {
+                    projectNames.add(p.getName());
                 }
 
-                STATIC_LOGGER.info("Projects list: " + projectNames.size());
                 return projectNames;
 
             } catch (Exception e) {
-                STATIC_LOGGER.info("Projects list: empty");
+                serverLog.error("Failed to populate project list: " + e.toString(), e);
                 return projectNames; // Return empty list of project names
             }
         }
-
-	    /*
-         *  Note: This method is called concurrently by multiple threads, refrain from using mutable
-	     *  shared state to avoid synchronization issues.
-	     */
-
-        public FormValidation doCheckProjectName(@AncestorInPath AbstractProject project, @QueryParameter final String projectName, @QueryParameter final boolean useOwnServerCredentials,
-                                                 @QueryParameter final String serverUrl, @QueryParameter final String username, @QueryParameter final String password,
-                                                 @QueryParameter final String groupId, @QueryParameter final String timestamp) {
-            // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
-
-            try {
-                final CxWebService cxWebService = prepareLoggedInWebservice(useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password));
-
-                if (msGuid.matcher(groupId).matches()) {
-                    String resolvedProjectName = projectName;
-                    if (project.getSomeBuildWithWorkspace() == null) { //is it the first build of a new project
-                        if (projectName.equals("${JOB_NAME}")) {
-                            resolvedProjectName = project.getName();
-                        }
-                    } else {
-                        EnvVars ev = new EnvVars(project.getSomeBuildWithWorkspace().getEnvironment(null));
-                        resolvedProjectName = ev.expand(projectName);
-                    }
-                    CxWSBasicRepsonse cxWSBasicRepsonse = cxWebService.validateProjectName(resolvedProjectName, groupId);
-                    if (cxWSBasicRepsonse.isIsSuccesfull()) {
-                        return FormValidation.ok("Project Name Validated Successfully");
-                    } else {
-                        if (cxWSBasicRepsonse.getErrorMessage().startsWith("project name validation failed: duplicate name, project name") ||
-                                cxWSBasicRepsonse.getErrorMessage().equalsIgnoreCase("Project name already exists")) {
-                            return FormValidation.ok("Scan will be added to existing project");
-                        } else if (cxWSBasicRepsonse.getErrorMessage().equalsIgnoreCase("project name validation failed: unauthorized user") ||
-                                cxWSBasicRepsonse.getErrorMessage().equalsIgnoreCase("Unauthorized user")) {
-                            return FormValidation.error("The user is not authorized to create/run Checkmarx projects");
-                        } else if (cxWSBasicRepsonse.getErrorMessage().startsWith("Exception occurred at IsValidProjectCreationRequest:")) {
-                            STATIC_LOGGER.error("Couldn't validate project name with Checkmarx sever:\n" + cxWSBasicRepsonse.getErrorMessage());
-                            return FormValidation.warning(cxWSBasicRepsonse.getErrorMessage());
-                        } else {
-                            return FormValidation.error(cxWSBasicRepsonse.getErrorMessage());
-                        }
-                    }
-                } else {
-                    return FormValidation.ok();
-                }
-            } catch (Exception e) {
-                STATIC_LOGGER.error("Couldn't validate project name with Checkmarx sever:\n" + e.getLocalizedMessage());
-                return FormValidation.warning("Can't reach server to validate project name");
-            }
-        }
-
 
         /**
          * Provides a list of presets from Checkmarx server for dynamic drop-down list in configuration page
@@ -1669,25 +1478,26 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 	     *  shared state to avoid synchronization issues.
 	     */
         public ListBoxModel doFillPresetItems(@QueryParameter final boolean useOwnServerCredentials, @QueryParameter final String serverUrl,
-                                              @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp) {
+                                              @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp, @QueryParameter final String credentialsId, @AncestorInPath Item item) {
             // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
             ListBoxModel listBoxModel = new ListBoxModel();
             try {
-                final CxWebService cxWebService = prepareLoggedInWebservice(useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password));
+                CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, StringEscapeUtils.escapeHtml4(getPasswordPlainText(password)), credentialsId, this, item);
+                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
 
-                final List<Preset> presets = cxWebService.getPresets();
-                for (Preset p : presets) {
-                    listBoxModel.add(new ListBoxModel.Option(p.getPresetName(), Long.toString(p.getID())));
+                //todo import preset
+                List<com.cx.restclient.sast.dto.Preset> presets = shragaClient.getPresetList();
+
+                for (com.cx.restclient.sast.dto.Preset p : presets) {
+                    listBoxModel.add(new ListBoxModel.Option(p.getName(), Integer.toString(p.getId())));
                 }
-
-                STATIC_LOGGER.info("Presets list: " + listBoxModel.size());
                 return listBoxModel;
 
             } catch (Exception e) {
-                STATIC_LOGGER.info("Presets list: empty");
+                serverLog.error("Failed to populate preset list: " + e.toString());
                 String message = "Provide Checkmarx server credentials to see presets list";
                 listBoxModel.add(new ListBoxModel.Option(message, message));
-                return listBoxModel; // Return empty list of project names
+                return listBoxModel;
             }
         }
 
@@ -1710,20 +1520,22 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         }
 
         public ListBoxModel doFillSourceEncodingItems(@QueryParameter final boolean useOwnServerCredentials, @QueryParameter final String serverUrl,
-                                                      @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp) {
+                                                      @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp, @QueryParameter final String credentialsId, @AncestorInPath Item item) {
             // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
             ListBoxModel listBoxModel = new ListBoxModel();
             try {
-                final CxWebService cxWebService = prepareLoggedInWebservice(useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password));
 
-                final List<ConfigurationSet> sourceEncodings = cxWebService.getSourceEncodings();
-                for (ConfigurationSet cs : sourceEncodings) {
-                    listBoxModel.add(new ListBoxModel.Option(cs.getConfigSetName(), Long.toString(cs.getID())));
+                CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, StringEscapeUtils.escapeHtml4(getPasswordPlainText(password)), credentialsId, this, item);
+
+                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
+                List<CxNameObj> configurationList = shragaClient.getConfigurationSetList();
+
+                for (CxNameObj cs : configurationList) {
+                    listBoxModel.add(new ListBoxModel.Option(cs.getName(), Long.toString(cs.getId())));
                 }
 
-                STATIC_LOGGER.info("Source encodings list: " + listBoxModel.size());
             } catch (Exception e) {
-                STATIC_LOGGER.info("Source encodings list: empty");
+                serverLog.error("Failed to populate source encodings list: " + e.getMessage());
                 String message = "Provide Checkmarx server credentials to see source encodings list";
                 listBoxModel.add(new ListBoxModel.Option(message, message));
             }
@@ -1739,25 +1551,35 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 	     */
 
         public ListBoxModel doFillGroupIdItems(@QueryParameter final boolean useOwnServerCredentials, @QueryParameter final String serverUrl,
-                                               @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp) {
+                                               @QueryParameter final String username, @QueryParameter final String password, @QueryParameter final String timestamp, @QueryParameter final String credentialsId, @AncestorInPath Item item) {
             // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
             ListBoxModel listBoxModel = new ListBoxModel();
             try {
-                final CxWebService cxWebService = prepareLoggedInWebservice(useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password));
-                final List<Group> groups = cxWebService.getAssociatedGroups();
-                for (Group group : groups) {
-                    listBoxModel.add(new ListBoxModel.Option(group.getGroupName(), group.getID()));
+                CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, StringEscapeUtils.escapeHtml4(getPasswordPlainText(password)), credentialsId, this, item);
+
+                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
+                List<Team> teamList = shragaClient.getTeamList();
+                for (Team team : teamList) {
+                    listBoxModel.add(new ListBoxModel.Option(team.getFullName(), team.getId()));
                 }
 
-                STATIC_LOGGER.info("Associated groups list: " + listBoxModel.size());
                 return listBoxModel;
 
             } catch (Exception e) {
-                STATIC_LOGGER.info("Associated groups: empty");
+                serverLog.error("Failed to populate team list: " + e.toString());
                 String message = "Provide Checkmarx server credentials to see teams list";
                 listBoxModel.add(new ListBoxModel.Option(message, message));
-                return listBoxModel; // Return empty list of project names
+                return listBoxModel;
             }
+
+        }
+
+        public ListBoxModel doFillFailBuildOnNewSeverityItems() {
+            ListBoxModel listBoxModel = new ListBoxModel();
+            listBoxModel.add(new ListBoxModel.Option("High", "HIGH"));
+            listBoxModel.add(new ListBoxModel.Option("Medium", "MEDIUM"));
+            listBoxModel.add(new ListBoxModel.Option("Low", "LOW"));
+            return listBoxModel;
 
         }
 
@@ -1772,11 +1594,10 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
             return listBoxModel;
         }
-		
-		
+
 
 		/*
-		 * Note: This method is called concurrently by multiple threads, refrain from using mutable shared state to
+         * Note: This method is called concurrently by multiple threads, refrain from using mutable shared state to
 		 * avoid synchronization issues.
 		 */
 
@@ -1785,7 +1606,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         }
 
 		/*
-		 * Note: This method is called concurrently by multiple threads, refrain from using mutable shared state to
+         * Note: This method is called concurrently by multiple threads, refrain from using mutable shared state to
 		 * avoid synchronization issues.
 		 */
 
@@ -1794,7 +1615,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         }
 
 		/*
-		 * Note: This method is called concurrently by multiple threads, refrain from using mutable shared state to
+         * Note: This method is called concurrently by multiple threads, refrain from using mutable shared state to
 		 * avoid synchronization issues.
 		 */
 
@@ -1889,6 +1710,14 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             }
         }
 
+        private FormValidation timeoutValid(final Integer value) {
+            if (value == null || value >= MINIMUM_TIMEOUT_IN_MINUTES) {
+                return FormValidation.ok();
+            } else {
+                return FormValidation.error("Number must be greater than or equal to " + MINIMUM_TIMEOUT_IN_MINUTES);
+            }
+        }
+
         public String getDefaultProjectName() {
             // Retrieves the job name from request URL, cleans it from special characters,\
             // and returns as a default project name.
@@ -1906,7 +1735,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             String ret = "";
             Pattern pattern = Pattern.compile(regex);
             Matcher matcher = pattern.matcher(decodedUrl);
-            if(matcher.find()) {
+            if (matcher.find()) {
                 ret = matcher.group(1);
             }
 
@@ -1956,6 +1785,29 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
         public void setLockVulnerabilitySettings(boolean lockVulnerabilitySettings) {
             this.lockVulnerabilitySettings = lockVulnerabilitySettings;
+        }
+
+        public ListBoxModel doFillCredentialsIdItems(@AncestorInPath Item item, @QueryParameter String credentialsId) {
+            StandardListBoxModel result = new StandardListBoxModel();
+            if (item == null) {
+                if (!Jenkins.getInstance().hasPermission(Jenkins.ADMINISTER)) {
+                    return result.add(credentialsId);
+                }
+            } else {
+                if (!item.hasPermission(Item.EXTENDED_READ)
+                        && !item.hasPermission(CredentialsProvider.USE_ITEM)) {
+                    return result.add(credentialsId);
+                }
+            }
+
+            return result
+                    .withEmptySelection()
+                    .withAll(CredentialsProvider.lookupCredentials(StandardUsernamePasswordCredentials.class, item, null, Collections.<DomainRequirement>emptyList()))
+                    .withMatching(CredentialsMatchers.withId(credentialsId));
+        }
+
+        public boolean isOldCredentials() {
+            return StringUtils.isEmpty(credentialsId) && (username != null || password != null);
         }
 
     }

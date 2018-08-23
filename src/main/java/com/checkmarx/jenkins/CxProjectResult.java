@@ -23,8 +23,8 @@ import org.kohsuke.stapler.StaplerResponse;
 
 import java.awt.*;
 import java.io.IOException;
-import java.util.Collection;
-import java.util.LinkedList;
+import java.util.*;
+import java.util.List;
 
 /**
  * @author denis
@@ -41,13 +41,34 @@ public class CxProjectResult implements Action {
 
     public CxScanResult getLastSynchronousBuildAction() {
         AbstractBuild<?, ?> r = this.owner.getLastBuild();
-        while (r != null) {
+        if(r != null) {
+            return r.getAction(CxScanResult.class);
+        }
 
-            CxScanResult a = r.getAction(CxScanResult.class);
-            if (a != null && !a.isScanRanAsynchronous()) {
-                return a;
+        return null;
+    }
+
+    public List<CxScanResult> getLastSynchronousBuildActions() {
+        AbstractBuild<?, ?> r = this.owner.getLastBuild();
+        if(r != null) {
+            return r.getActions(CxScanResult.class);
+        }
+        return null;
+    }
+
+    public CxScanResult getLastSynchronousSASTBuildAction() {
+
+        List<CxScanResult> lastSynchronousBuildActions = getLastSynchronousBuildActions();
+        if(lastSynchronousBuildActions != null) {
+            for (CxScanResult res : lastSynchronousBuildActions) {
+                if(res.getSastEnabled() == null) {//case the build is before plugin version 8.80.0
+                    return res;
+                }
+
+                else if(res.getSastEnabled()) {
+                    return res;
+                }
             }
-            r = r.getPreviousBuild();
         }
         return null;
     }
@@ -63,20 +84,12 @@ public class CxProjectResult implements Action {
 
     @Override
     public String getDisplayName() {
-        if (isShowResults()) {
-            return "Checkmarx Last Scan Results";
-        } else {
-            return null;
-        }
+      return null;
     }
 
     @Override
     public String getIconFileName() {
-        if (isShowResults()) {
-            return getIconPath() + "CxIcon24x24.png";
-        } else {
-            return null;
-        }
+        return null;
     }
 
     @NotNull
@@ -93,11 +106,6 @@ public class CxProjectResult implements Action {
 
     public boolean isResultAvailable() {
         return getLastSynchronousBuildAction() != null;
-    }
-
-    public boolean isLastBuildAsynchronous() {
-        CxScanResult action = getLastBuildAction();
-        return action != null && action.isScanRanAsynchronous();
     }
 
     private CxScanResult getLastBuildAction() {
@@ -167,7 +175,7 @@ public class CxProjectResult implements Action {
 
     private CategoryDataset buildDataSet(StaplerRequest req) {
 
-        CxScanResult lastBuildAction = getLastSynchronousBuildAction();
+        CxScanResult lastBuildAction = getLastSynchronousSASTBuildAction();
         if (lastBuildAction == null) {
             // We get here is there are no builds with scan results.
             // In this case we generate an empty graph

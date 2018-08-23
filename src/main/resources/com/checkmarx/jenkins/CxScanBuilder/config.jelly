@@ -1,5 +1,5 @@
 <?jelly escape-by-default='true'?>
-<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout"
+<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:c="/lib/credentials" xmlns:l="/lib/layout"
 	xmlns:t="/lib/hudson" xmlns:f="/lib/form" descriptor="${it.descriptor}">
 	<!-- This jelly script is used for per-project configuration. -->
 
@@ -12,11 +12,15 @@
           </f:section>
 
 
-          <f:section title="CxSAST Scan">
+          <f:section title="Checkmarx Server Settings">
           </f:section>
 
             <!-- Creates a text field that shows the value of the "name" property. When submitted, it will be passed to the
                 corresponding constructor parameter. -->
+            <f:invisibleEntry>
+                <f:readOnlyTextbox field="username"/>
+                <f:readOnlyTextbox field="password"/>
+            </f:invisibleEntry>
             <f:optionalBlock title="Use default server credentials (${descriptor.credentialsDescription})"
                 inline="true" field="useOwnServerCredentials" negative="true"
                 checked="${instance==null?true:!instance.useOwnServerCredentials}">
@@ -25,15 +29,18 @@
                     <f:textbox default="${descriptor.serverUrl}" />
                 </f:entry>
 
-                <f:entry title="Username" field="username">
-                    <f:textbox default="${descriptor.username}" />
+                <j:if test="${instance.isOldCredentials()}">
+                    <f:block>
+                        <div style="font-weight: bold; padding: 8px;">You are currently using the Checkmarx credential method. To switch to the new Jenkins Credential method, click Add and select your new credentials.</div>
+                    </f:block>
+                </j:if>
+
+                <f:entry field="credentialsId" title="${%Credentials}">
+                    <c:select />
                 </f:entry>
 
-                <f:entry title="Password" field="password">
-                    <f:password />
-                </f:entry>
                 <f:validateButton title="Test Connection" progress="Testing..." method="testConnection"
-                    with="serverUrl,username,password,timestamp" />
+                    with="serverUrl,username,password,timestamp,credentialsId" />
             </f:optionalBlock>
 
             <f:entry title="Checkmarx project name" description="Existing projects appear in a completion list when server url is provided (up to 20)">
@@ -44,62 +51,69 @@
                 <f:select />
             </f:entry>
 
-            <f:entry title="Preset" field="preset">
-                <f:select />
-            </f:entry>
 
-             <!-- GLOBAL INCLUDE\EXCLUDE -->
-            <f:radioBlock checked="${instance == null || instance.exclusionsSetting == null || instance.exclusionsSetting.equals('global')}" inline="true"
-                name="exclusionsSetting" title="Use Global Include/Exclude Settings" value="global">
-                <f:nested>
-                    <f:entry title="Exclude Folders" field="globalExcludeFolders">
-                        <f:textbox readonly="readonly"  value="${descriptor.excludeFolders}"/>
-                    </f:entry>
-                    <f:entry title="Include/Exclude Wildcard Patterns" field="globalFilterPattern">
-                        <f:textarea readonly="readonly" value="${descriptor.filterPattern}" />
-                    </f:entry>
-                </f:nested>
-            </f:radioBlock>
+    <f:section title="CxSAST Scan">
+    </f:section>
+
+    <f:optionalBlock title="Enable CxSAST scan" inline="true" field="sastEnabled" checked="${instance == null || instance.sastEnabled == null || instance.sastEnabled}">
+
+        <f:entry title="Preset" field="preset">
+            <f:select />
+        </f:entry>
+
+                 <!-- GLOBAL INCLUDE\EXCLUDE -->
+                <f:radioBlock checked="${instance == null || instance.exclusionsSetting == null || instance.exclusionsSetting.equals('global')}" inline="true"
+                    name="exclusionsSetting" title="Use Global Include/Exclude Settings" value="global">
+                    <f:nested>
+                        <f:entry title="Exclude Folders" field="globalExcludeFolders">
+                            <f:textbox readonly="readonly"  value="${descriptor.excludeFolders}"/>
+                        </f:entry>
+                        <f:entry title="Include/Exclude Wildcard Patterns" field="globalFilterPattern">
+                            <f:textarea readonly="readonly" value="${descriptor.filterPattern}" />
+                        </f:entry>
+                    </f:nested>
+                </f:radioBlock>
 
 
-             <!-- SPECIFIC INCLUDE\EXCLUDE -->
-             <f:radioBlock checked="${instance.getExclusionsSetting().equals('job')}" inline="true"
-                             name="exclusionsSetting" title="Specific Include/Exclude Settings" value="job">
-                <f:nested>
-                    <f:entry title="Exclude Folders" field="excludeFolders">
-                       <f:textbox default="${descriptor.excludeFolders}" />
-                    </f:entry>
-                   <f:entry title="Include/Exclude Wildcard Patterns" field="filterPattern">
-                       <f:textarea default="${descriptor.filterPattern}" />
+                 <!-- SPECIFIC INCLUDE\EXCLUDE -->
+                 <f:radioBlock checked="${instance.getExclusionsSetting().equals('job')}" inline="true"
+                                 name="exclusionsSetting" title="Specific Include/Exclude Settings" value="job">
+                    <f:nested>
+                        <f:entry title="Exclude Folders" field="excludeFolders">
+                           <f:textbox default="${descriptor.excludeFolders}" />
+                        </f:entry>
+                       <f:entry title="Include/Exclude Wildcard Patterns" field="filterPattern">
+                           <f:textarea default="${descriptor.filterPattern}" />
 
-                   </f:entry>
-                </f:nested>
-            </f:radioBlock>
+                       </f:entry>
+                    </f:nested>
+                </f:radioBlock>
 
-            <f:optionalBlock title="Incremental" field="incremental" inline="true" checked="${instance.incremental}">
+                <f:optionalBlock title="Incremental" field="incremental" inline="true" checked="${instance.incremental}">
 
-                <f:optionalBlock title="Schedule periodic full scans" field="fullScansScheduled" inline="true"
-                    checked="${instance.fullScansScheduled}">
-                    <f:entry
-                        title="Number of incremental scans between full scans (${descriptor.FULL_SCAN_CYCLE_MIN}-${descriptor.FULL_SCAN_CYCLE_MAX})"
-                        field="fullScanCycle">
-                        <f:number clazz="positive-number" min="${descriptor.FULL_SCAN_CYCLE_MIN}" max="${descriptor.FULL_SCAN_CYCLE_MAX}"
-                            step="1" default="10" />
-                    </f:entry>
+                    <f:optionalBlock title="Schedule periodic full scans" field="fullScansScheduled" inline="true"
+                        checked="${instance.fullScansScheduled}">
+                        <f:entry
+                            title="Number of incremental scans between full scans (${descriptor.FULL_SCAN_CYCLE_MIN}-${descriptor.FULL_SCAN_CYCLE_MAX})"
+                            field="fullScanCycle">
+                            <f:number clazz="positive-number" min="${descriptor.FULL_SCAN_CYCLE_MIN}" max="${descriptor.FULL_SCAN_CYCLE_MAX}"
+                                step="1" default="10" />
+                        </f:entry>
+                    </f:optionalBlock>
                 </f:optionalBlock>
-            </f:optionalBlock>
 
 
-            <f:entry title="Source character encoding (configuration)" field="sourceEncoding" description="Default Configuration uses UTF-8">
-                <f:select />
-            </f:entry>
+                <f:entry title="Source character encoding (configuration)" field="sourceEncoding" description="Default Configuration uses UTF-8">
+                    <f:select />
+                </f:entry>
 
-            <f:entry title="Comment" field="comment">
-                <f:textarea />
-            </f:entry>
+                <f:entry title="Comment" field="comment">
+                    <f:textarea />
+                </f:entry>
 
-            <f:optionalBlock title="Skip scan if triggered by SCM Changes" inline="true" field="skipSCMTriggers" />
-            <f:optionalBlock title="Avoid duplicate project scans in queue" inline="true" field="avoidDuplicateProjectScans" />
+        <f:optionalBlock title="Avoid duplicate project scans in queue" inline="true" field="avoidDuplicateProjectScans" />
+    </f:optionalBlock>
+    <f:optionalBlock title="Skip scan if triggered by SCM Changes" inline="true" field="skipSCMTriggers" />
 
 
 	<!-- -= OSA SCAN =- -->
@@ -113,7 +127,10 @@
             <f:entry title="Exclude folders" field="excludeOpenSourceFolders">
                 <f:textbox/>
             </f:entry>
-
+            <f:entry title="Archive extract patterns" field="osaArchiveIncludePatterns">
+                <f:textbox default="${descriptor.DEFAULT_OSA_ARCHIVE_INCLUDE_PATTERNS}"/>
+            </f:entry>
+            <f:optionalBlock title="Execute dependency managers 'install packages' command before Scan" inline="true" field="osaInstallBeforeScan" />
         </f:optionalBlock>
       </f:section>
 
@@ -127,7 +144,7 @@
 
 
 
-            <f:entry name="jobStatusOnError" title="Job status when CxSAST scan returns an error:" field="jobStatusOnError">
+            <f:entry name="jobStatusOnError" title="Job status when scan returns an error:" field="jobStatusOnError">
                     <f:enum field="jobStatusOnError">${it.displayName}</f:enum>
                 </f:entry>
 
@@ -140,13 +157,13 @@
                         <f:readOnlyTextbox value="Setting Locked by Administrator (${descriptor.JobGlobalStatusOnThresholdViolation})" />
                     </f:entry>
 
-                    <f:entry title="High severity vulnerabilities threshold">
+                    <f:entry title="SAST High severity vulnerabilities threshold">
                         <f:readOnlyTextbox value="${descriptor.highThresholdEnforcement}" />
                     </f:entry>
-                    <f:entry title="Medium severity vulnerabilities threshold">
+                    <f:entry title="SAST Medium severity vulnerabilities threshold">
                         <f:readOnlyTextbox value="${descriptor.mediumThresholdEnforcement}" />
                     </f:entry>
-                    <f:entry title="Low severity vulnerabilities threshold">
+                    <f:entry title="SAST Low severity vulnerabilities threshold">
                         <f:readOnlyTextbox value="${descriptor.lowThresholdEnforcement}" />
                     </f:entry>
                     <f:entry title="OSA high severity vulnerabilities threshold">
@@ -160,6 +177,9 @@
                     </f:entry>
 
                     <f:optionalBlock title="Generate CxSAST PDF report" inline="true" field="generatePdfReport" />
+
+                    <!-- -= enableProjectPolicyEnforcement =- -->
+                    <f:optionalBlock title="Enable project's OSA policy enforcement" inline="true" field="enableProjectPolicyEnforcement" />
                 </j:when>
 
                 <!-- ** use specific configuration setting ** -->
@@ -174,6 +194,9 @@
 
                         <!-- -= Generate PDF report =- -->
                         <f:optionalBlock title="Generate CxSAST PDF report" inline="true" field="generatePdfReport" />
+
+                        <!-- -= enableProjectPolicyEnforcement =- -->
+                        <f:optionalBlock title="Enable project's OSA policy enforcement" inline="true" field="enableProjectPolicyEnforcement" />
 
                        <!-- ** Enable CxSAST vulnerability threshold ** -->
                         <f:optionalBlock title="Enable vulnerability threshold" inline="true"
@@ -190,13 +213,13 @@
                                                 <f:readOnlyTextbox value="${descriptor.JobGlobalStatusOnThresholdViolation.displayName}" />
                                             </f:entry>
 
-                                            <f:entry title="High severity vulnerabilities threshold">
+                                            <f:entry title="SAST High severity vulnerabilities threshold">
                                                 <f:readOnlyTextbox value="${descriptor.highThresholdEnforcement}" />
                                             </f:entry>
-                                            <f:entry title="Medium severity vulnerabilities threshold">
+                                            <f:entry title="SAST Medium severity vulnerabilities threshold">
                                                 <f:readOnlyTextbox value="${descriptor.mediumThresholdEnforcement}" />
                                             </f:entry>
-                                            <f:entry title="Low severity vulnerabilities threshold">
+                                            <f:entry title="SAST Low severity vulnerabilities threshold">
                                                 <f:readOnlyTextbox value="${descriptor.lowThresholdEnforcement}" />
                                             </f:entry>
                                             <f:entry title="OSA high severity vulnerabilities threshold">
@@ -217,15 +240,22 @@
                                             <f:entry title="Build status when results exceed threshold:" field="vulnerabilityThresholdResult">
                                                 <f:select />
                                             </f:entry>
-                                            <f:entry title="High severity vulnerabilities threshold" field="highThreshold">
+                                            <f:entry title="SAST High severity vulnerabilities threshold" field="highThreshold">
                                                 <f:number clazz="positive-number" min="0" step="1" default="" />
                                             </f:entry>
-                                            <f:entry title="Medium severity vulnerabilities threshold" field="mediumThreshold">
+                                            <f:entry title="SAST Medium severity vulnerabilities threshold" field="mediumThreshold">
                                                 <f:number clazz="positive-number" min="0" step="1" default="" />
                                             </f:entry>
-                                            <f:entry title="Low severity vulnerabilities threshold" field="lowThreshold">
+                                            <f:entry title="SAST Low severity vulnerabilities threshold" field="lowThreshold">
                                                 <f:number clazz="positive-number" min="0" step="1" default="" />
                                             </f:entry>
+
+                                            <f:optionalBlock title="Fail the build for new SAST vulnerabilities" inline="true" field="failBuildOnNewResults">
+                                                <f:entry title="Fail for the following severity or greater" field="failBuildOnNewSeverity">
+                                                    <f:select field="failBuildOnNewSeverity" />
+                                                </f:entry>
+                                            </f:optionalBlock>
+
                                             <f:entry title="OSA high severity vulnerabilities threshold" field="osaHighThreshold">
                                                 <f:number clazz="positive-number" min="0" step="1" default="" />
                                             </f:entry>
@@ -243,15 +273,22 @@
                                     <f:entry title="Build status when results exceed threshold:" field="vulnerabilityThresholdResult">
                                         <f:select />
                                     </f:entry>
-                                    <f:entry title="High severity vulnerabilities threshold" field="highThreshold">
+                                    <f:entry title="SAST High severity vulnerabilities threshold" field="highThreshold">
                                         <f:number clazz="positive-number" min="0" step="1" default="" />
                                     </f:entry>
-                                    <f:entry title="Medium severity vulnerabilities threshold" field="mediumThreshold">
+                                    <f:entry title="SAST Medium severity vulnerabilities threshold" field="mediumThreshold">
                                         <f:number clazz="positive-number" min="0" step="1" default="" />
                                     </f:entry>
-                                    <f:entry title="Low severity vulnerabilities threshold" field="lowThreshold">
+                                    <f:entry title="SAST Low severity vulnerabilities threshold" field="lowThreshold">
                                         <f:number clazz="positive-number" min="0" step="1" default="" />
                                     </f:entry>
+
+                                    <f:optionalBlock title="Fail the build for new SAST vulnerabilities" inline="true" field="failBuildOnNewResults">
+                                        <f:entry title="Fail for the following severity or greater" field="failBuildOnNewSeverity">
+                                            <f:select field="failBuildOnNewSeverity" />
+                                        </f:entry>
+                                    </f:optionalBlock>
+
                                     <f:entry title="OSA high severity vulnerabilities threshold" field="osaHighThreshold">
                                         <f:number clazz="positive-number" min="0" step="1" default="" />
                                     </f:entry>
@@ -265,6 +302,7 @@
                             </j:choose>
 
                         </f:optionalBlock>
+
 
                     </f:optionalBlock>
                 </j:otherwise>

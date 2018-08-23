@@ -21,49 +21,44 @@ apply plugin: 'provided-base'
 repositories {
 	jcenter()
 	maven { url 'http://repo.jenkins-ci.org/releases/' }
+	maven { url 'http://cx-artifactory:8081/artifactory/libs-release/' }
+	maven { url 'http://cx-artifactory:8081/artifactory/libs-snapshot' }
+	maven { url 'http://cx-artifactory:8081/artifactory/plugins-release-local/' }
 }
-
-sourceCompatibility = 7
-targetCompatibility = 7
-
 
 test {
 	maxParallelForks = Runtime.getRuntime().availableProcessors()
 }
 
+//currently there is an issue with Java8 and javadocs,
+// Java 8 seems to be really strict with the JavaDoc. This is due to the new doclint for Javadoc
+//for now we disable it so we can build the project properly
+allprojects {
+	tasks.withType(Javadoc).all { enabled = false }
+}
+
 dependencies {
-	provided 'com.intellij:annotations:12.0'
+	provided 'com.intellij:annotations:12.0',
+			 'org.slf4j:slf4j-api:1.6.1'
 
-	compile	'org.apache.ant:ant:1.9.2',
-			'org.apache.commons:commons-lang3:3.1',
-			'commons-io:commons-io:2.4',
-			'com.googlecode.lambdaj:lambdaj:2.3.3',
-			'org.glassfish.jersey.core:jersey-client:2.22.1',
-			'org.glassfish.jersey.media:jersey-media-json-jackson:2.22.1',
-			'org.glassfish.jersey.media:jersey-media-multipart:2.22.1',
-			'org.apache.httpcomponents:httpmime:4.4.1'
+	compile	'com.checkmarx:cx-client-common:8.90.0-20180819.085114-3'
 
-	optionalJenkinsPlugins 'org.jenkins-ci.main:maven-plugin:1.509.3@jar'
+
+	optionalJenkinsPlugins 'org.jenkins-ci.main:maven-plugin:1.509.3@jar',
+			               'org.jenkins-ci.plugins:credentials:1.23@jar'
 
 
 	testCompile 'junit:junit:4.12',
-			'org.jmockit:jmockit:1.16'
+			'org.eclipse.sisu:org.eclipse.sisu.plexus:0.0.0.M5',
+			'org.jmockit:jmockit:1.16',
+			'com.google.guava:guava:21.0'
+
 
 	// Fails with Gradle 2.12 and up without it. Related to https://issues.jenkins-ci.org/browse/JENKINS-17129
 	jenkinsTest 'org.jenkins-ci.plugins:ant:1.2@jar',
 			'org.jenkins-ci.plugins:mailer:1.1@jar',
 			'org.jenkins-ci.plugins:matrix-project:1.4@jar'
 
-}
-
-wsdl2java {
-	generatedWsdlDir = file("build/generated-sources")  // target directory for generated source code
-	wsdlDir = file("src/main/config/com/checkmarx/jenkins/CxWebService") // define to support incremental build
-	wsdlsToGenerate = [
-		['-mark-generated', '-p', 'com.checkmarx.ws.CxWSResolver', '-client', "${wsdlDir}" + '/cxwsresolver.wsdl'],
-		['-mark-generated', '-p', 'com.checkmarx.ws.CxJenkinsWebService', '-client', "${wsdlDir}" + '/CxJenkinsWebService.wsdl']
-	]
-	cxfVersion = "3.1.4"
 }
 
 
@@ -104,8 +99,8 @@ jenkinsPlugin {
 			name 'Checkmarx Support'
 		}
 		developer {
-			id 'sergeyk'
-			name 'Sergey Kadaner'
+			id 'galdor'
+			name 'Gal Dor'
 		}
 	}
 }

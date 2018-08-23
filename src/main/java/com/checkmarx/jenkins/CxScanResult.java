@@ -1,12 +1,17 @@
 package com.checkmarx.jenkins;
 
-import com.checkmarx.jenkins.logger.CxPluginLogger;
+import com.checkmarx.jenkins.legacy8_7.OsaScanResult;
+import com.checkmarx.jenkins.legacy8_7.QueryResult;
+import com.checkmarx.jenkins.legacy8_7.SastScanResult;
+import com.checkmarx.jenkins.legacy8_7.ThresholdConfig;
+import com.cx.restclient.configuration.CxScanConfig;
+import com.cx.restclient.sast.dto.SASTResults;
 import hudson.PluginWrapper;
 import hudson.model.Action;
-import hudson.model.Hudson;
 import hudson.model.Run;
 import hudson.util.IOUtils;
 import jenkins.model.Jenkins;
+import org.apache.commons.io.FileUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.kohsuke.stapler.StaplerRequest;
@@ -15,8 +20,12 @@ import org.kohsuke.stapler.StaplerResponse;
 import javax.servlet.ServletOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.Charset;
+import java.util.Collection;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * @author denis
@@ -24,15 +33,14 @@ import java.util.List;
  */
 public class CxScanResult implements Action {
 
-    private transient CxPluginLogger logger = new CxPluginLogger();
-
     public final Run<?, ?> owner;
-    private final long projectId;
-    private final boolean scanRanAsynchronous;
-    private String serverUrl;
+    private final long projectId = 0;
+    private boolean scanRanAsynchronous = false;
+    private String serverUrl = "";
 
     private long scanId;
 
+    private Boolean sastEnabled;
     private boolean osaEnabled;
 
     //Results
@@ -44,17 +52,44 @@ public class CxScanResult implements Action {
     private boolean osaThresholdsEnabled = false;
     private ThresholdConfig sastThresholdConfig;
     private ThresholdConfig osaThresholdConfig;
+    private boolean isThresholdForNewResultExceeded = false;
 
     private File pdfReport;
     public static final String PDF_REPORT_NAME = "ScanReport.pdf";
+    public static final String OSA_PDF_REPORT_NAME = "OSAReport.pdf";
+    private boolean osaSuccessful; //osa fails flag for jelly
 
+    private String htmlReportName;
+
+    public String getHtmlReportName() {
+        return htmlReportName;
+    }
+
+    public void setHtmlReportName(String htmlReportName) {
+        this.htmlReportName = htmlReportName;
+    }
+
+    public CxScanResult(Run<?, ?> owner, CxScanConfig config) {
+        this.scanRanAsynchronous = !config.getSynchronous();
+        this.sastEnabled = config.getSastEnabled();
+        this.osaEnabled = config.getOsaEnabled();
+        this.owner = owner;
+    }
+
+    public void setSastResults(SASTResults results) {
+        this.highCount = results.getHigh();
+        this.mediumCount = results.getMedium();
+        this.lowCount = results.getLow();
+    }
+
+    public Boolean getSastEnabled() {
+        return sastEnabled;
+    }
 
     public CxScanResult(Run<?, ?> owner, String serverUrl, long projectId, boolean scanRanAsynchronous) {
-        this.projectId = projectId;
-        this.scanRanAsynchronous = scanRanAsynchronous;
         this.owner = owner;
         this.serverUrl = serverUrl;
-        this.resultIsValid = true;
+        this.resultIsValid = false; //sast fails flag for jelly
         this.errorMessage = "No Scan Results"; // error message to appear if results were not parsed
         this.highQueryResultList = new LinkedList<>();
         this.mediumQueryResultList = new LinkedList<>();
@@ -74,7 +109,11 @@ public class CxScanResult implements Action {
         this.sastThresholdConfig = thresholdConfig;
         this.setThresholdsEnabled(true);
         //todo erase when legacy code is no longer needed
-       initializeSastLegacyThresholdVariables(thresholdConfig);
+        initializeSastLegacyThresholdVariables(thresholdConfig);
+    }
+
+    public void setThresholdForNewResultExceeded(boolean thresholdForNewResultExceeded) {
+        isThresholdForNewResultExceeded = thresholdForNewResultExceeded;
     }
 
     public String getLargeIconFileName() {
@@ -87,20 +126,14 @@ public class CxScanResult implements Action {
 
     @Override
     public String getIconFileName() {
-        if (isShowResults()) {
-            return getIconPath() + "CxIcon24x24.png";
-        } else {
-            return null;
-        }
+        return null;
+
     }
 
     @Override
     public String getDisplayName() {
-        if (isShowResults()) {
-            return "Checkmarx Scan Results";
-        } else {
-            return null;
-        }
+        return null;
+
     }
 
     @Override
@@ -122,7 +155,7 @@ public class CxScanResult implements Action {
     public boolean isShowResults() {
         @Nullable
         CxScanBuilder.DescriptorImpl descriptor = (CxScanBuilder.DescriptorImpl) Jenkins.getInstance().getDescriptor(CxScanBuilder.class);
-        return descriptor != null && !descriptor.isHideResults() && !isScanRanAsynchronous();
+        return descriptor != null && !descriptor.isHideResults();
     }
 
     public boolean isOsaEnabled() {
@@ -187,30 +220,53 @@ public class CxScanResult implements Action {
         outputStream.close();
     }
 
-    public void doOsaPdfReport(StaplerRequest req, StaplerResponse rsp) throws IOException {
+    public static String resolveHTMLReportName(boolean sastEnabled, boolean osaEnabled) {
+        if(sastEnabled && osaEnabled) {
+            return "Report_CxSAST_CxOSA.html";
+        }
 
-        rsp.setContentType("application/pdf");
-        ServletOutputStream outputStream = rsp.getOutputStream();
-        File buildDirectory = owner.getRootDir();
-        File a = new File(buildDirectory, "/checkmarx/" + "OSAReport.pdf");
+        if(sastEnabled) {
+            return "Report_CxSAST.html";
+        }
 
-        IOUtils.copy(a, outputStream);
+        if(osaEnabled) {
+            return "Report_CxOSA.html";
+        }
 
-        outputStream.flush();
-        outputStream.close();
+        return "";
     }
 
 
-    public void doOsaHtmlReport(StaplerRequest req, StaplerResponse rsp) throws IOException {
-        rsp.setContentType("text/html");
-        ServletOutputStream outputStream = rsp.getOutputStream();
-        File buildDirectory = owner.getRootDir();
-        File a = new File(buildDirectory, "/checkmarx/" + "OSAReport.html");
 
-        IOUtils.copy(a, outputStream);
+    public String getHtmlReport() throws IOException {
+        String htmlReport;
+        File cxBuildDirectory = new File(owner.getRootDir(), "checkmarx");
 
-        outputStream.flush();
-        outputStream.close();
+        //backward compatibility (up to version 8.80.0)
+        if(htmlReportName == null) {
+            File oldReport = new File(cxBuildDirectory, "report.html");
+            if(oldReport.exists()) {
+                htmlReport = FileUtils.readFileToString(oldReport, Charset.defaultCharset());
+                Pattern patt = Pattern.compile("(<div[^>]*)(\\s*/>)");
+                Matcher mattcher = patt.matcher(htmlReport);
+                if (mattcher.find()){
+                    htmlReport = mattcher.replaceAll("$1></div>");
+                }
+
+                return htmlReport;
+            }
+        }
+
+        Collection<File> files = FileUtils.listFiles(cxBuildDirectory, null, false);
+
+        for (File f: files) {
+            if(htmlReportName.equals(f.getName())) {
+                htmlReport = FileUtils.readFileToString(f, Charset.defaultCharset());
+                return htmlReport;
+            }
+        }
+
+        return "<h1>Checkmarx HTML report not found<h1>";
     }
 
     /**
@@ -245,10 +301,10 @@ public class CxScanResult implements Action {
     }
 
     public String getOsaProjectStateUrl() {
-        return serverUrl + "/CxWebClient/portal#/projectState/" + projectId + "/OSA";
+        return serverUrl + "/CxWebClient/SPA/#/viewer/project/" + projectId;
     }
 
-//    http://localhost/CxWebClient/ViewerMain.aspx?scanid=1030692&projectid=40565
+    //    http://localhost/CxWebClient/ViewerMain.aspx?scanid=1030692&projectid=40565
     public String getCodeViewerUrl() {
         return serverUrl + "/CxWebClient/ViewerMain.aspx";
     }
@@ -259,8 +315,11 @@ public class CxScanResult implements Action {
 
     public void setOsaScanResult(OsaScanResult osaScanResult) {
         this.osaScanResult = osaScanResult;
+
         //todo erase when legacy code is no longer needed
-        initializeOsaLegacyVariables(osaScanResult);
+        if (osaScanResult.isOsaLicense()) {
+            initializeOsaLegacyVariables(osaScanResult);
+        }
     }
 
     public SastScanResult getSastScanResult() {
@@ -281,24 +340,28 @@ public class CxScanResult implements Action {
         return scanId;
     }
 
+    public boolean getIsThresholdForNewResultExceeded() {
+        return isThresholdForNewResultExceeded;
+    }
+
 
     public boolean isThresholdExceeded() {
         boolean ret = isThresholdExceededByLevel(sastScanResult.getHighCount(), sastThresholdConfig.getHighSeverity());
         ret |= isThresholdExceededByLevel(sastScanResult.getMediumCount(), sastThresholdConfig.getMediumSeverity());
         ret |= isThresholdExceededByLevel(sastScanResult.getLowCount(), sastThresholdConfig.getLowSeverity());
-       return ret;
+        return ret;
     }
 
     public boolean isOsaThresholdExceeded() {
         boolean ret = isThresholdExceededByLevel(osaScanResult.getOsaHighCount(), osaThresholdConfig.getHighSeverity());
         ret |= isThresholdExceededByLevel(osaScanResult.getOsaMediumCount(), osaThresholdConfig.getMediumSeverity());
         ret |= isThresholdExceededByLevel(osaScanResult.getOsaLowCount(), osaThresholdConfig.getLowSeverity());
-       return ret;
+        return ret;
     }
 
-    private boolean isThresholdExceededByLevel(int count, Integer threshold){
+    private boolean isThresholdExceededByLevel(int count, Integer threshold) {
         boolean ret = false;
-        if (threshold != null && count > threshold){
+        if (threshold != null && count > threshold) {
             ret = true;
         }
         return ret;
@@ -338,27 +401,27 @@ public class CxScanResult implements Action {
     private String errorMessage;
 
 
-    public void initializeSastLegacyVariables(SastScanResult sastScanResult){
-         this.highCount = sastScanResult.getHighCount();
-         this.mediumCount = sastScanResult.getMediumCount();
-         this.lowCount = sastScanResult.getLowCount();
-         this.infoCount = sastScanResult.getInfoCount();
+    public void initializeSastLegacyVariables(SastScanResult sastScanResult) {
+        this.highCount = sastScanResult.getHighCount();
+        this.mediumCount = sastScanResult.getMediumCount();
+        this.lowCount = sastScanResult.getLowCount();
+        this.infoCount = sastScanResult.getInfoCount();
 
-         this.highQueryResultList = sastScanResult.getHighQueryResultList();
-         this.mediumQueryResultList = sastScanResult.getMediumQueryResultList();
-         this.lowQueryResultList = sastScanResult.getLowQueryResultList();
-         this.infoQueryResultList = sastScanResult.getInfoQueryResultList();
+        this.highQueryResultList = sastScanResult.getHighQueryResultList();
+        this.mediumQueryResultList = sastScanResult.getMediumQueryResultList();
+        this.lowQueryResultList = sastScanResult.getLowQueryResultList();
+        this.infoQueryResultList = sastScanResult.getInfoQueryResultList();
 
-         this.resultDeepLink = sastScanResult.getResultDeepLink();
-         this.scanStart = sastScanResult.getScanStart();
-         this.scanEnd = sastScanResult.getScanEnd();
-         this.linesOfCodeScanned = sastScanResult.getLinesOfCodeScanned();
-         this.filesScanned = sastScanResult.getFilesScanned();
-         this.scanType = sastScanResult.getScanType();
+        this.resultDeepLink = sastScanResult.getResultDeepLink();
+        this.scanStart = sastScanResult.getScanStart();
+        this.scanEnd = sastScanResult.getScanEnd();
+        this.linesOfCodeScanned = sastScanResult.getLinesOfCodeScanned();
+        this.filesScanned = sastScanResult.getFilesScanned();
+        this.scanType = sastScanResult.getScanType();
 
-         this.resultIsValid = sastScanResult.isResultIsValid();
-         this.errorMessage = sastScanResult.getErrorMessage();
-     }
+        this.resultIsValid = sastScanResult.isResultIsValid();
+        this.errorMessage = sastScanResult.getErrorMessage();
+    }
 
     public int getHighCount() {
         return highCount;
@@ -437,8 +500,8 @@ public class CxScanResult implements Action {
     private int osaVulnerableAndOutdatedLibs;
     private int osaNoVulnerabilityLibs;
 
-    public void initializeOsaLegacyVariables(OsaScanResult osaScanResult){
-        if(osaScanResult != null) {
+    public void initializeOsaLegacyVariables(OsaScanResult osaScanResult) {
+        if (osaScanResult != null) {
             this.osaHighCount = osaScanResult.getOsaHighCount();
             this.osaMediumCount = osaScanResult.getOsaMediumCount();
             this.osaLowCount = osaScanResult.getOsaLowCount();
@@ -481,13 +544,13 @@ public class CxScanResult implements Action {
     @Nullable
     private Integer osaLowThreshold;
 
-    private void initializeSastLegacyThresholdVariables(ThresholdConfig thresholdConfig){
+    private void initializeSastLegacyThresholdVariables(ThresholdConfig thresholdConfig) {
         this.setHighThreshold(thresholdConfig.getHighSeverity());
         this.setMediumThreshold(thresholdConfig.getMediumSeverity());
         this.setLowThreshold(thresholdConfig.getLowSeverity());
     }
 
-    private void initializeOsaLegacyThresholdVariables(ThresholdConfig thresholdConfig){
+    private void initializeOsaLegacyThresholdVariables(ThresholdConfig thresholdConfig) {
         this.setOsaHighThreshold(thresholdConfig.getHighSeverity());
         this.setOsaMediumThreshold(thresholdConfig.getMediumSeverity());
         this.setOsaLowThreshold(thresholdConfig.getLowSeverity());
@@ -547,4 +610,11 @@ public class CxScanResult implements Action {
         this.osaLowThreshold = osaLowThreshold;
     }
 
+    public void setOsaSuccessful(boolean osaSuccessful) {
+        this.osaSuccessful = osaSuccessful;
+    }
+
+    public boolean isOsaSuccessful() {
+        return osaSuccessful;
+    }
 }
