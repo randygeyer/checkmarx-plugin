@@ -24,6 +24,7 @@ repositories {
 	maven { url 'http://cx-artifactory:8081/artifactory/libs-release/' }
 	maven { url 'http://cx-artifactory:8081/artifactory/libs-snapshot' }
 	maven { url 'http://cx-artifactory:8081/artifactory/plugins-release-local/' }
+	maven { url 'http://cx-artifactory:8081/artifactory/libs-snapshot-local' }
 }
 
 test {
@@ -41,7 +42,7 @@ dependencies {
 	provided 'com.intellij:annotations:12.0',
 			 'org.slf4j:slf4j-api:1.6.1'
 
-	compile	'com.checkmarx:cx-client-common:8.90.0-20180819.085114-3'
+	compile	'com.checkmarx:cx-client-common:9.00.0-SNAPSHOT'
 
 
 	optionalJenkinsPlugins 'org.jenkins-ci.main:maven-plugin:1.509.3@jar',
