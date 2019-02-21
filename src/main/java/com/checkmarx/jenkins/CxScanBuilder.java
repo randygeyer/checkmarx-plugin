@@ -5,7 +5,6 @@ import com.cloudbees.plugins.credentials.CredentialsProvider;
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
 import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 import com.cloudbees.plugins.credentials.domains.DomainRequirement;
-import com.cx.restclient.CxShragaClient;
 import com.cx.restclient.common.ShragaUtils;
 import com.cx.restclient.common.summary.SummaryUtils;
 import com.cx.restclient.configuration.CxScanConfig;
@@ -733,6 +732,13 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         ret.setUrl(cxCredentials.getServerUrl().trim());
         ret.setUsername(cxCredentials.getUsername());
         ret.setPassword(cxCredentials.getPassword());
+        
+        //proxy
+        if (descriptor.isUseProxy()) {
+        	ret.setUseProxy(descriptor.isUseProxy());
+        	ret.setProxyHost(descriptor.getProxyHost());
+        	ret.setProxyPort(descriptor.getProxyPort());
+        }
 
         //project
         ret.setProjectName(env.expand(projectName.trim()));
@@ -824,6 +830,11 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         log.info("plugin version: " + CxConfig.version());
         log.info("server url: " + config.getUrl());
         log.info("username: " + config.getUsername());
+        if (config.isUseProxy()) {
+            log.info("useProxy: " + config.isUseProxy());
+            log.info("proxyHost: " + config.getProxyHost());
+            log.info("proxyPort: " + config.getProxyPort());
+        }
         log.info("project name: " + config.getProjectName());
         log.info("team path: " + config.getTeamPath());
         log.info("team id: " + config.getTeamId());
@@ -910,7 +921,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             ObjectMapper objectMapper = new ObjectMapper();
             String json = null;
             json = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(jsonObj);
-            FileUtils.writeStringToFile(to, json);
+            FileUtils.writeStringToFile(to, json, Charset.defaultCharset());
             //log.info(description + " file generated successfully. location: [" + to.getAbsolutePath() + "]");
             log.info("Copying file [" + to.getName() + "] to workspace [" + to.getAbsolutePath() + "]");
         } catch (Exception e) {
@@ -1124,6 +1135,13 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
         private String credentialsId;
 
+        // Proxy settings
+        private boolean useProxy;
+        @Nullable
+        private String proxyHost;
+        @Nullable
+        private Integer proxyPort;
+
         private boolean prohibitProjectCreation;
         private boolean hideResults;
         private boolean enableCertificateValidation;
@@ -1152,7 +1170,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
         private Integer scanTimeoutDuration; // In minutes.
         private boolean lockVulnerabilitySettings = true;
 
-        private final transient Pattern msGuid = Pattern.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
+        //private final transient Pattern msGuid = Pattern.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
 
         public DescriptorImpl() {
             load();
@@ -1202,6 +1220,32 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
         public void setCredentialsId(String credentialsId) {
             this.credentialsId = credentialsId;
+        }
+
+        public boolean isUseProxy() {
+            return this.useProxy;
+        }
+        
+        public void setUseProxy(boolean useProxy) {
+            this.useProxy = useProxy;
+        }
+
+        @Nullable
+        public String getProxyHost() {
+            return this.proxyHost;
+        }
+        
+        public void setProxyHost(@Nullable String proxyHost) {
+            this.proxyHost = proxyHost;
+        }
+        
+        @Nullable
+        public Integer getProxyPort() {
+            return this.proxyPort;
+        }
+        
+        public void setProxyPort(@Nullable Integer proxyPort) {
+            this.proxyPort = proxyPort;
         }
 
         public boolean isProhibitProjectCreation() {
@@ -1335,7 +1379,8 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             return timeoutValid(value);
         }
 
-        @Override
+        @SuppressWarnings("rawtypes")
+		@Override
         public boolean isApplicable(Class<? extends AbstractProject> aClass) {
             return true;
         }
@@ -1385,16 +1430,39 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
          *  Note: This method is called concurrently by multiple threads, refrain from using mutable
 	     *  shared state to avoid synchronization issues.
 	     */
-        public FormValidation doTestConnection(@QueryParameter final String serverUrl, @QueryParameter final String password,
-                                               @QueryParameter final String username, @QueryParameter final String timestamp, @QueryParameter final String credentialsId, @AncestorInPath Item item) {
+        public FormValidation doTestConnection(
+        		@QueryParameter final String serverUrl, @QueryParameter final String password,
+                @QueryParameter final String username,  @QueryParameter Boolean useProxy,
+                @QueryParameter final String proxyHost, @QueryParameter final String proxyPort,
+                @QueryParameter final String timestamp, @QueryParameter final String credentialsId, 
+                @AncestorInPath Item item) {
             // timestamp is not used in code, it is one of the arguments to invalidate Internet Explorer cache
 
+        	final String errMsg = "Failed to login to Checkmarx server";
+        	
+            //validate params
+            if (StringUtils.isEmpty(serverUrl))
+                return FormValidation.error("Server URL must be supplied");
+            if (useProxy != null && useProxy) {
+                if (StringUtils.isEmpty(proxyHost))
+                    return FormValidation.error("Proxy host must be supplied");
+                else if (proxyHost.contains("://"))
+                    return FormValidation.error("Please remove the url protocol from the proxy host");
+            }
+
+            Integer port = null;
+            if (useProxy && StringUtils.isNumeric(proxyPort)) {
+                port = Integer.parseInt(proxyPort);
+            }
+                
             CxCredentials cred = null;
-            CxShragaClient shragaClient = null;
+            CxShragaWrapper shragaClient = null;
             try {
                 cred = CxCredentials.resolveCredentials(true, serverUrl, username, getPasswordPlainText(password), credentialsId, this, item);
                 CxCredentials.validateCxCredentials(cred);
-                shragaClient = new CxShragaClient(cred.getServerUrl(), cred.getUsername(), cred.getPassword(), CX_ORIGIN, !this.isEnableCertificateValidation(), serverLog);
+                shragaClient = new CxShragaWrapper(cred.getServerUrl(), cred.getUsername(), cred.getPassword(),
+                		useProxy, proxyHost, port,
+                		CX_ORIGIN, !this.isEnableCertificateValidation(), serverLog);
             } catch (Exception e) {
                 return buildError(e, "Failed to init cx client");
             }
@@ -1404,10 +1472,10 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
                 return FormValidation.ok("Success");
 
             } catch (UnknownHostException e) {
-                return buildError(e, "Failed to login to Chekmarx server");
+                return buildError(e, errMsg);
 
             } catch (Exception e) {
-                return buildError(e, "Failed to login to Chekmarx server");
+                return buildError(e, errMsg);
 
             }
         }
@@ -1422,9 +1490,11 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
          *  Note: This method is called concurrently by multiple threads, refrain from using mutable
 	     *  shared state to avoid synchronization issues.
 	     */
-        private CxShragaClient prepareLoggedInClient(CxCredentials credentials)
+        private CxShragaWrapper prepareLoggedInClient(CxCredentials credentials)
                 throws IOException, CxClientException, CxTokenExpiredException {
-            CxShragaClient ret = new CxShragaClient(credentials.getServerUrl(), credentials.getUsername(), credentials.getPassword(), CX_ORIGIN, !this.isEnableCertificateValidation(), serverLog);
+            CxShragaWrapper ret = new CxShragaWrapper(credentials.getServerUrl(), credentials.getUsername(), credentials.getPassword(), 
+            		useProxy, proxyHost, proxyPort,
+            		CX_ORIGIN, !this.isEnableCertificateValidation(), serverLog);
             ret.login();
             return ret;
         }
@@ -1440,7 +1510,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
             try {
                 CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password), credentialsId, this, item);
-                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
+                CxShragaWrapper shragaClient = prepareLoggedInClient(credentials);
                 List<Project> projects = shragaClient.getAllProjects();
 
                 for (Project p : projects) {
@@ -1475,7 +1545,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             ListBoxModel listBoxModel = new ListBoxModel();
             try {
                 CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password), credentialsId, this, item);
-                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
+                CxShragaWrapper shragaClient = prepareLoggedInClient(credentials);
 
                 //todo import preset
                 List<com.cx.restclient.sast.dto.Preset> presets = shragaClient.getPresetList();
@@ -1519,7 +1589,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
 
                 CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password), credentialsId, this, item);
 
-                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
+                CxShragaWrapper shragaClient = prepareLoggedInClient(credentials);
                 List<CxNameObj> configurationList = shragaClient.getConfigurationSetList();
 
                 for (CxNameObj cs : configurationList) {
@@ -1549,7 +1619,7 @@ public class CxScanBuilder extends Builder implements SimpleBuildStep {
             try {
                 CxCredentials credentials = CxCredentials.resolveCredentials(!useOwnServerCredentials, serverUrl, username, getPasswordPlainText(password), credentialsId, this, item);
 
-                CxShragaClient shragaClient = prepareLoggedInClient(credentials);
+                CxShragaWrapper shragaClient = prepareLoggedInClient(credentials);
                 List<Team> teamList = shragaClient.getTeamList();
                 for (Team team : teamList) {
                     listBoxModel.add(new ListBoxModel.Option(team.getFullName(), team.getId()));

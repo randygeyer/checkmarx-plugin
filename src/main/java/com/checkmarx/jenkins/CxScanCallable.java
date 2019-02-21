@@ -42,7 +42,7 @@ public class CxScanCallable implements FilePath.FileCallable<ScanResults>, Seria
         boolean sastCreated = false;
         boolean osaCreated = false;
 
-        CxShragaClient shraga = new CxShragaClient(config, log);
+        CxShragaWrapper shraga = new CxShragaWrapper(config, log);
         try {
             shraga.init();
         } catch (Exception e) {

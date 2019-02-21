@@ -35,8 +35,17 @@
 			<f:readOnlyTextbox field="password"/>
 		</f:invisibleEntry>
 
-		<f:validateButton title="Test Connection" progress="Testing..." method="testConnection"
-			with="serverUrl,username,password,timestamp,credentialsId" />
+        <f:optionalBlock title="Use proxy server" inline="true" field="useProxy">
+            <f:entry title="Proxy server" field="proxyHost">
+                <f:textbox />
+            </f:entry>
+            <f:entry title="Proxy port" field="proxyPort">
+                <f:number clazz="positive-number" min="80" step="1" default="80" />
+            </f:entry>
+        </f:optionalBlock>
+        
+        <f:validateButton title="Test Connection" progress="Testing..." method="testConnection"
+                                  with="serverUrl,username,password,useProxy,proxyHost,proxyPort,timestamp,credentialsId" />
 
 		<f:entry title="Default Exclude folders" field="excludeFolders">
             <f:textbox />
